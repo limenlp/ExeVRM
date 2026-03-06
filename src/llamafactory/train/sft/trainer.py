@@ -110,6 +110,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # Persistent vLLM engine for sleep/wake mode
         self._vllm_engine = None
         self._vllm_engine_sleeping = False
+        self._expandable_segments_was_enabled = False  # track runtime state across sleep/wake
 
         self._train_video_reward_metric: Optional[ComputeVideoRewardAccuracy] = None
         # Keep O(1) memory: accumulate correct/total counts instead of storing a growing buffer.
@@ -369,9 +370,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             labels = inputs.pop("labels", None)
             # Remove video_metadata as it's not a valid argument for model.generate()
             inputs.pop("video_metadata", None)
-            # Remove per-video STP/TTP settings (only used in forward pass, not generate)
-            inputs.pop("_per_video_use_stp", None)
-            inputs.pop("_per_video_use_ttp", None)
+            # NOTE: Keep _per_video_use_stp and _per_video_use_ttp in inputs.
+            # They flow through generate() → prepare_inputs_for_generation() → model.forward()
+            # → patched_forward() where they're consumed via kwargs.pop().
+            # Without them, TTP/STP defaults to globally enabled, ignoring per-dataset
+            # use_stp/use_ttp=false settings in dataset_info.json.
             # Set synced_gpus=True for DDP distributed training to avoid deadlock.
             # In DDP mode, different GPUs may generate sequences of different lengths,
             # which can cause deadlock during gather operations if synced_gpus is not set.
@@ -477,6 +480,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # with PyTorch's expandable_segments.  Disable it at both the env-var
         # level (checked by vLLM's assertion) and at the runtime level
         # (checked by torch.cuda.MemPool).
+        #
+        # Following verl's pattern, expandable_segments stays DISABLED for the
+        # entire lifetime of the vLLM engine.  The caller
+        # (_vllm_evaluate_sleep_wake) re-enables it after engine sleep.
         saved_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
         if "expandable_segments:True" in saved_alloc_conf:
             new_conf = saved_alloc_conf.replace("expandable_segments:True", "expandable_segments:False")
@@ -486,13 +493,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = prefix + "expandable_segments:False"
 
         # Also disable at the PyTorch runtime allocator level.
-        _expandable_was_enabled = False
+        # Track the original state so the caller can restore it later.
         try:
             snap = torch.cuda.memory._snapshot()
             if snap.get("allocator_settings", {}).get("expandable_segments", False):
-                _expandable_was_enabled = True
-                torch.cuda.memory._set_allocator_settings("expandable_segments:False")
-                logger.info("vLLM eval: disabled expandable_segments at runtime for MemPool compatibility")
+                self._expandable_segments_was_enabled = True
+                self._set_expandable_segments(False)
+                logger.info("vLLM eval: disabled expandable_segments at runtime for CuMemAllocator compatibility")
         except Exception:
             pass
 
@@ -517,12 +524,31 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # weight dir) to avoid huggingface_hub validation errors on local
             # paths like /dev/shm.  The tokenizer never changes during training.
             tokenizer_path = self.model_args.model_name_or_path if self.model_args else model_path
+            # Dynamically cap gpu_memory_utilization based on actual free
+            # memory.  DeepSpeed / FSDP may leave optimizer states or
+            # buffers on GPU that we couldn't fully offload.
+            configured_gpu_util = self.finetuning_args.vllm_eval_gpu_util
+            free_mem, total_mem = torch.cuda.mem_get_info()
+            # Reserve headroom for vision-encoder workspace (embedding
+            # 88K patches needs ~2-3 GiB), attention workspace, and
+            # fragmentation.  8 GiB is safe for Qwen3-VL-8B at 720p.
+            headroom_bytes = 8 * (2**30)  # 8 GiB
+            max_vllm_bytes = max(0, free_mem - headroom_bytes)
+            max_safe_util = max_vllm_bytes / total_mem
+            effective_gpu_util = min(configured_gpu_util, max(0.20, max_safe_util))
+            logger.info(
+                "vLLM eval: gpu_memory_utilization=%.2f (configured=%.2f, "
+                "free=%.1f GiB, headroom=%.0f GiB)",
+                effective_gpu_util, configured_gpu_util,
+                free_mem / 2**30, headroom_bytes / 2**30,
+            )
+
             engine_kwargs = {
                 "model": model_path,
                 "tokenizer": tokenizer_path,
                 "trust_remote_code": True,
                 "tensor_parallel_size": self.finetuning_args.vllm_eval_tp_size or 1,
-                "gpu_memory_utilization": self.finetuning_args.vllm_eval_gpu_util,
+                "gpu_memory_utilization": effective_gpu_util,
                 "max_model_len": max_model_len,
                 "max_num_batched_tokens": max_model_len,
                 "enforce_eager": self.finetuning_args.vllm_eval_enforce_eager,
@@ -545,16 +571,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = saved_mp
             else:
                 os.environ.pop("VLLM_ENABLE_V1_MULTIPROCESSING", None)
-            # Restore CUDA allocator config (env var + runtime).
+            # Restore the CUDA allocator env-var so it doesn't leak into
+            # subprocesses.  The *runtime* setting stays disabled — the
+            # caller re-enables expandable_segments after engine sleep.
             if saved_alloc_conf:
                 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = saved_alloc_conf
             else:
                 os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
-            if _expandable_was_enabled:
-                try:
-                    torch.cuda.memory._set_allocator_settings("expandable_segments:True")
-                except Exception:
-                    pass
 
         return engine
 
@@ -695,20 +718,214 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         )
         self._vllm_engine.reset_prefix_cache()
 
+    def _offload_deepspeed_states_to_cpu(self, rank: int = 0) -> None:
+        """Move DeepSpeed ZeRO-2 internal GPU buffers to CPU.
+
+        DeepSpeed ZeRO Stage 2 stores data in internal flat buffers that are
+        invisible to ``model.to("cpu")``.  We must move them explicitly:
+
+        1. ``fp16_groups_flat`` – full FP16 model copy per GPU
+        2. ``single_partition_of_fp32_groups`` – partitioned FP32 master weights
+        3. ``optimizer.state`` – partitioned FP32 momentum + variance
+        """
+        if not hasattr(self.model, "optimizer") or self.model.optimizer is None:
+            return
+
+        zero_opt = self.model.optimizer
+        offloaded = 0
+
+        try:
+            # 1. FP16 flat parameter groups (full model replica per GPU)
+            if hasattr(zero_opt, "fp16_groups_flat"):
+                for buf in zero_opt.fp16_groups_flat:
+                    if isinstance(buf, torch.Tensor) and buf.is_cuda:
+                        buf.data = buf.data.cpu()
+                        offloaded += buf.numel() * buf.element_size()
+
+            # Also handle bit16_groups (newer DeepSpeed versions)
+            if hasattr(zero_opt, "bit16_groups_flat"):
+                for buf in zero_opt.bit16_groups_flat:
+                    if isinstance(buf, torch.Tensor) and buf.is_cuda:
+                        buf.data = buf.data.cpu()
+                        offloaded += buf.numel() * buf.element_size()
+
+            # 2. FP32 master weights (partitioned across ranks)
+            if hasattr(zero_opt, "single_partition_of_fp32_groups"):
+                for group in zero_opt.single_partition_of_fp32_groups:
+                    for i, p in enumerate(group):
+                        if isinstance(p, torch.Tensor) and p.is_cuda:
+                            group[i] = p.cpu()
+                            offloaded += p.numel() * p.element_size()
+
+            # Also handle fp32_groups_flat_partition
+            if hasattr(zero_opt, "fp32_groups_flat_partition"):
+                for buf in zero_opt.fp32_groups_flat_partition:
+                    if isinstance(buf, torch.Tensor) and buf.is_cuda:
+                        buf.data = buf.data.cpu()
+                        offloaded += buf.numel() * buf.element_size()
+
+            # 3. Underlying optimizer states (momentum + variance)
+            inner_opt = getattr(zero_opt, "optimizer", zero_opt)
+            if hasattr(inner_opt, "state"):
+                for state_vals in inner_opt.state.values():
+                    if not isinstance(state_vals, dict):
+                        continue
+                    for k, v in state_vals.items():
+                        if isinstance(v, torch.Tensor) and v.is_cuda:
+                            state_vals[k] = v.cpu()
+                            offloaded += v.numel() * v.element_size()
+
+            # 4. Gradient buffers
+            if hasattr(zero_opt, "grad_partitions_flat_buffer"):
+                buf = zero_opt.grad_partitions_flat_buffer
+                if isinstance(buf, torch.Tensor) and buf.is_cuda:
+                    buf.data = buf.data.cpu()
+                    offloaded += buf.numel() * buf.element_size()
+
+            logger.info(
+                "vLLM eval [sleep/wake]: rank %d — offloaded %.1f GiB of DeepSpeed state to CPU",
+                rank, offloaded / 2**30,
+            )
+        except Exception as e:
+            logger.warning("vLLM eval: DeepSpeed offload partial (freed %.1f GiB): %s", offloaded / 2**30, e)
+
+    def _restore_deepspeed_states_to_gpu(self, device: "torch.device", rank: int = 0) -> None:
+        """Move DeepSpeed ZeRO-2 internal buffers back to GPU after vLLM eval.
+
+        IMPORTANT: after moving ``bit16_groups_flat`` back to GPU we must
+        rebuild the parameter views via ``_update_model_bit16_weights``.
+        The offload step (``buf.data = buf.data.cpu()``) broke the view
+        relationship between model parameters and the flat buffer.  Without
+        rebuilding, the subsequent ``unwrapped.to(device)`` would allocate
+        **separate** GPU tensors for every parameter, doubling model memory
+        (~16 GiB for an 8B model) and causing OOM.
+        """
+        if not hasattr(self.model, "optimizer") or self.model.optimizer is None:
+            return
+
+        zero_opt = self.model.optimizer
+        restored = 0
+
+        try:
+            if hasattr(zero_opt, "fp16_groups_flat"):
+                for buf in zero_opt.fp16_groups_flat:
+                    if isinstance(buf, torch.Tensor) and not buf.is_cuda:
+                        buf.data = buf.data.to(device)
+                        restored += buf.numel() * buf.element_size()
+
+            if hasattr(zero_opt, "bit16_groups_flat"):
+                for buf in zero_opt.bit16_groups_flat:
+                    if isinstance(buf, torch.Tensor) and not buf.is_cuda:
+                        buf.data = buf.data.to(device)
+                        restored += buf.numel() * buf.element_size()
+
+            # Rebuild parameter-to-flat-buffer views.  DeepSpeed's
+            # _update_model_bit16_weights() calls unflatten() which
+            # creates views (not copies) of the flat buffer and
+            # reassigns them to each model parameter's .data.
+            if hasattr(zero_opt, "_update_model_bit16_weights"):
+                n_groups = len(
+                    getattr(zero_opt, "bit16_groups",
+                            getattr(zero_opt, "fp16_groups", []))
+                )
+                for gi in range(n_groups):
+                    zero_opt._update_model_bit16_weights(gi)
+                logger.info(
+                    "vLLM eval [sleep/wake]: rank %d — rebuilt %d param-group "
+                    "views into flat buffers", rank, n_groups,
+                )
+
+            if hasattr(zero_opt, "single_partition_of_fp32_groups"):
+                for group in zero_opt.single_partition_of_fp32_groups:
+                    for i, p in enumerate(group):
+                        if isinstance(p, torch.Tensor) and not p.is_cuda:
+                            group[i] = p.to(device)
+                            restored += p.numel() * p.element_size()
+
+            if hasattr(zero_opt, "fp32_groups_flat_partition"):
+                for buf in zero_opt.fp32_groups_flat_partition:
+                    if isinstance(buf, torch.Tensor) and not buf.is_cuda:
+                        buf.data = buf.data.to(device)
+                        restored += buf.numel() * buf.element_size()
+
+            inner_opt = getattr(zero_opt, "optimizer", zero_opt)
+            if hasattr(inner_opt, "state"):
+                for state_vals in inner_opt.state.values():
+                    if not isinstance(state_vals, dict):
+                        continue
+                    for k, v in state_vals.items():
+                        if isinstance(v, torch.Tensor) and not v.is_cuda:
+                            state_vals[k] = v.to(device)
+                            restored += v.numel() * v.element_size()
+
+            if hasattr(zero_opt, "grad_partitions_flat_buffer"):
+                buf = zero_opt.grad_partitions_flat_buffer
+                if isinstance(buf, torch.Tensor) and not buf.is_cuda:
+                    buf.data = buf.data.to(device)
+                    restored += buf.numel() * buf.element_size()
+
+            logger.info(
+                "vLLM eval [sleep/wake]: rank %d — restored %.1f GiB of DeepSpeed state to GPU",
+                rank, restored / 2**30,
+            )
+        except Exception as e:
+            logger.warning("vLLM eval: DeepSpeed restore partial (%.1f GiB): %s", restored / 2**30, e)
+
+    @staticmethod
+    def _aggressive_empty_cache(max_retries: int = 3) -> None:
+        """Aggressively free GPU memory (verl-style).
+
+        Runs ``gc.collect()`` → ``torch.cuda.synchronize()`` →
+        ``torch.cuda.empty_cache()`` in a retry loop, stopping early when
+        less than 1 GiB is freed per iteration.
+        """
+        import gc
+
+        for _ in range(max_retries):
+            before = torch.cuda.memory_reserved()
+            gc.collect()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            freed = before - torch.cuda.memory_reserved()
+            if freed < 2**30:  # < 1 GiB freed → diminishing returns
+                break
+
+    @staticmethod
+    def _set_expandable_segments(enable: bool) -> None:
+        """Toggle PyTorch's expandable_segments allocator setting at runtime.
+
+        ``expandable_segments`` is incompatible with vLLM's CuMemAllocator.
+        Following verl's pattern, we disable it for the *entire* duration
+        that the vLLM engine is awake, not just during engine creation.
+        """
+        try:
+            torch.cuda.memory._set_allocator_settings(
+                f"expandable_segments:{enable}"
+            )
+        except Exception:
+            pass
+
     def _cleanup_vllm_engine(self) -> None:
         """Destroy the persistent vLLM engine and free resources."""
-        import gc
-        import shutil
-
         if self._vllm_engine is not None:
+            # Try to sleep before destroying so CuMemAllocator releases
+            # its memory-pool allocations (weights + KV cache).
+            try:
+                if not self._vllm_engine_sleeping:
+                    self._vllm_engine.sleep(level=2)
+            except Exception:
+                pass
             del self._vllm_engine
             self._vllm_engine = None
             self._vllm_engine_sleeping = False
-            gc.collect()
-            torch.cuda.empty_cache()
+            self._aggressive_empty_cache()
             logger.info("vLLM eval: persistent engine destroyed")
-        # Clean up any leftover /dev/shm from initial engine creation
-        shutil.rmtree("/dev/shm/llamafactory_vllm_weights", ignore_errors=True)
+        # NOTE: Do NOT delete /dev/shm/llamafactory_vllm_weights here.
+        # In multi-rank training, one rank may fail (e.g. OOM) and call
+        # this cleanup while other ranks still need the processor configs
+        # from the shared directory.  The config files are tiny (few KB)
+        # and harmless.  They will be overwritten on the next eval or
+        # cleaned up on process exit.
 
     def _pre_init_vllm_parallel_state(self) -> None:
         """Pre-initialise vLLM's distributed parallel state on ALL ranks.
@@ -775,7 +992,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         First eval: save weights to /dev/shm → all ranks create engine → generate → sleep.
         Subsequent evals: all ranks wake → reload weights → generate → sleep.
         """
-        import gc
         import time
 
         import torch.distributed as dist
@@ -786,16 +1002,52 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        # --- Step 1 (all ranks): offload training model to CPU ---
-        unwrapped.to("cpu")
-        gc.collect()
-        torch.cuda.empty_cache()
-        logger.info("vLLM eval [sleep/wake]: rank %d — training model offloaded to CPU", rank)
+        # --- Step 1 (all ranks): free GPU memory for vLLM ---
+        # HF Trainer stores the DeepSpeed engine as self.deepspeed (= self.model_wrapped),
+        # NOT as self.model.  self.model may be the bare module without the optimizer.
+        _ds_engine = getattr(self, "deepspeed", None)
+        has_ds = _ds_engine is not None and getattr(_ds_engine, "optimizer", None) is not None
+
+        # Zero out gradient buffers to free GPU memory.
+        for param in unwrapped.parameters():
+            param.grad = None
+
+        if has_ds:
+            # DeepSpeed ZeRO-2: keep training state on GPU.
+            #
+            # DeepSpeed's internal reference chain (parallel_partitioned_bit16_groups
+            # → narrow() views of flat buffer, optimizer.state keys → FP32 master
+            # weights, param._hp_mapping.optim_fragment → optimizer state views)
+            # makes it impossible to fully offload GPU memory via .data replacement.
+            # Attempting to offload leaves ~30 GiB of "zombie" GPU memory that
+            # cannot be freed until the references are cleared.
+            #
+            # Instead, we keep everything on GPU and let vLLM's dynamic
+            # gpu_memory_utilization cap (in _create_vllm_engine) use whatever
+            # free memory remains.  After vLLM sleep, training resumes
+            # immediately without any restore step.
+            self._aggressive_empty_cache()
+        else:
+            # Non-DeepSpeed: simply move model to CPU.
+            unwrapped.to("cpu")
+            self._aggressive_empty_cache()
+
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        logger.info(
+            "vLLM eval [sleep/wake]: rank %d — prepared for vLLM "
+            "(free=%.1f GiB / total=%.1f GiB, deepspeed=%s)",
+            rank, free_mem / 2**30, total_mem / 2**30, has_ds,
+        )
 
         # --- Step 2 (all ranks): pre-initialise vLLM parallel state ---
         self._pre_init_vllm_parallel_state()
 
-        # --- Step 3 (all ranks): create or wake engine ---
+        # --- Step 3 (all ranks): disable expandable_segments, create or wake engine ---
+        # Following verl's pattern: expandable_segments stays disabled for
+        # the entire duration that the vLLM engine is awake, because it
+        # conflicts with vLLM's CuMemAllocator virtual-memory allocations.
+        self._set_expandable_segments(False)
+
         metrics: dict[str, float] = {}
         try:
             from vllm import SamplingParams
@@ -822,8 +1074,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
                     dist.barrier()  # all engines loaded before cleanup
                     if rank == 0:
-                        import shutil
-                        shutil.rmtree(shm_dir, ignore_errors=True)
+                        import glob as _glob
+                        # Only delete large weight files; keep config/processor
+                        # files (preprocessor_config.json, config.json, etc.)
+                        # because vLLM lazily loads the HF processor from the
+                        # model path during chat(), not during engine creation.
+                        for _wf in _glob.glob(os.path.join(shm_dir, "*.safetensors")):
+                            os.remove(_wf)
                 else:
                     # Eval-only mode: load from original model path.
                     model_path = self.model_args.model_name_or_path if self.model_args else self.args.output_dir
@@ -833,9 +1090,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 self._vllm_engine_sleeping = False
             else:
                 # --- Subsequent eval: wake up and reload weights ---
+                # Following verl's pattern: wake weights first, sync, then
+                # clean up before allocating KV cache so it has maximum
+                # free memory available.
                 t0 = time.time()
                 self._vllm_engine.wake_up(tags=["weights"])
                 self._sync_weights_to_vllm(unwrapped)
+                self._aggressive_empty_cache()
                 self._vllm_engine.wake_up(tags=["kv_cache"])
                 logger.info("vLLM eval [sleep/wake]: rank %d — engine woke + weights reloaded (%.1fs)", rank, time.time() - t0)
                 self._vllm_engine_sleeping = False
@@ -872,15 +1133,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             # Pass video/image processing parameters so vLLM matches
             # the training-time preprocessing (resolution, fps, max frames).
-            # ``do_sample_frames=True`` is required — without it vLLM treats
-            # the frames loaded by VideoMediaIO as pre-sampled and ignores
-            # fps / max_num_frames entirely.
-            mm_kwargs: dict[str, Any] = {"do_sample_frames": True}
+            # NOTE: do_sample_frames must be False.  vLLM's VideoMediaIO
+            # already samples frames using the num_frames configured in
+            # media_io_kwargs (see _create_vllm_engine).  Setting
+            # do_sample_frames=True causes the HF processor to resample
+            # from the already-sampled array using the *original* video
+            # frame count, producing out-of-bounds indices.
+            mm_kwargs: dict[str, Any] = {}
             if self.model_args:
                 mm_kwargs["max_pixels"] = getattr(self.model_args, "video_max_pixels", 921600)
                 mm_kwargs["min_pixels"] = getattr(self.model_args, "video_min_pixels", 1)
-                mm_kwargs["fps"] = getattr(self.model_args, "video_fps", 2.0)
-                mm_kwargs["max_num_frames"] = getattr(self.model_args, "video_maxlen", 128)
 
             # Suppress vLLM's verbose logging during generation so the
             # progress bar is not drowned out.
@@ -906,13 +1168,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             for i in range(0, len(shard_data), batch_size):
                 batch = shard_data[i : min(i + batch_size, len(shard_data))]
                 messages_batch = [item["messages"] for item in batch]
-                results = self._vllm_engine.chat(
-                    messages_batch, sampling_params, use_tqdm=False,
-                    chat_template_kwargs=chat_kwargs if chat_kwargs else None,
-                    mm_processor_kwargs=mm_kwargs if mm_kwargs else None,
-                )
-                local_preds.extend(r.outputs[0].text for r in results)
-                local_labels.extend(item["label"] for item in batch)
+                try:
+                    results = self._vllm_engine.chat(
+                        messages_batch, sampling_params, use_tqdm=False,
+                        chat_template_kwargs=chat_kwargs if chat_kwargs else None,
+                        mm_processor_kwargs=mm_kwargs if mm_kwargs else None,
+                    )
+                    local_preds.extend(r.outputs[0].text for r in results)
+                    local_labels.extend(item["label"] for item in batch)
+                except (torch.OutOfMemoryError, ValueError) as e:
+                    # OOM on large videos (e.g. 50 frames @ 720p needs ~2 GiB
+                    # workspace for masked_scatter).  Skip this batch rather
+                    # than failing the entire eval.
+                    logger.warning(
+                        "vLLM eval: rank %d — skipping batch %d/%d due to OOM: %s",
+                        rank, i // batch_size, len(shard_data) // batch_size, str(e)[:200],
+                    )
+                    local_preds.extend("" for _ in batch)
+                    local_labels.extend(item["label"] for item in batch)
+                    torch.cuda.empty_cache()
                 local_done += len(batch)
 
                 if pbar is not None:
@@ -934,9 +1208,23 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             )
 
             # --- Step 5 (all ranks): sleep engine ---
+            # vLLM's CuMemAllocator (enabled by sleep mode) uses cuMemCreate
+            # virtual memory, which IS released back to the system on sleep.
+            # This allows training to reclaim the GPU memory.
             if is_training:
+                # Clear multimodal encoder cache + prefix cache BEFORE sleep.
+                # These caches hold processed video/image features on GPU and
+                # are NOT released by sleep(level=2).
+                self._vllm_engine.reset_prefix_cache()
                 self._vllm_engine.sleep(level=2)
                 self._vllm_engine_sleeping = True
+                self._aggressive_empty_cache()
+
+                free_mem, total_mem = torch.cuda.mem_get_info()
+                logger.info(
+                    "vLLM eval [sleep/wake]: rank %d — after sleep: free=%.1f / %.1f GiB",
+                    rank, free_mem / 2**30, total_mem / 2**30,
+                )
 
             # --- Step 6: gather predictions on rank 0 ---
             if world_size > 1:
@@ -965,11 +1253,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             logger.warning("vLLM eval [sleep/wake] failed on rank %d: %s", rank, e, exc_info=True)
             self._cleanup_vllm_engine()
 
+        # Re-enable expandable_segments now that vLLM is asleep / destroyed.
+        if self._expandable_segments_was_enabled:
+            self._set_expandable_segments(True)
+
         self.accelerator.wait_for_everyone()
 
         # --- Step 7: restore training model to GPU ---
-        unwrapped.to(device)
-        logger.info("vLLM eval [sleep/wake]: rank %d — training model restored to %s", rank, device)
+        if has_ds:
+            # DeepSpeed ZeRO-2: training state never left GPU — nothing to do.
+            pass
+        else:
+            unwrapped.to(device)
+
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        logger.info(
+            "vLLM eval [sleep/wake]: rank %d — training model restored to %s "
+            "(free=%.1f / %.1f GiB)",
+            rank, device, free_mem / 2**30, total_mem / 2**30,
+        )
 
         # Broadcast metrics from rank 0
         if world_size > 1:
@@ -1108,7 +1410,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self.accelerator.wait_for_everyone()
 
         # --- Step 4: restore training model to GPU (all ranks) ---
-        unwrapped.to(device)
+        has_ds = hasattr(self.model, "optimizer") and self.model.optimizer is not None
+        if has_ds:
+            self._restore_deepspeed_states_to_gpu(device)
+        else:
+            unwrapped.to(device)
         logger.info("vLLM eval: training model restored to %s", device)
 
         # Cleanup temp dir

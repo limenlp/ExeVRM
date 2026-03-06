@@ -1,13 +1,11 @@
 ### model
 model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
 image_max_pixels: 921600  # 1280*720
-
 video_fps: 1.0
-video_maxlen: 50
+video_maxlen: 50  # qwen3-vl has temporal merging with size 2, video frames will reduce to at most 25 in video_grid_thw.
 video_max_pixels: 921600  # 1280*720
 video_min_pixels: 1
 trust_remote_code: true
-
 
 ### stp parameters
 use_stp: true
@@ -19,12 +17,10 @@ stp_large_comp_threshold: 10  # Skip components with >30 connected patches
 # This runs STP on each raw temporal frame and ORs the keep masks.
 use_raw_frames_in_stp: true
 
-
 ### Temporal token removal
 use_ttp: true
 ttp_threshold: 0.9999  # Cosine similarity threshold (higher = more aggressive removal)
 ttp_similarity_metric: cosine  # choices: [cosine, l2, l1]
-
 
 ### method
 stage: sft
@@ -41,8 +37,11 @@ predict_with_generate: true
 eval_dataset: osworld_agentnet_testset,scalecua_testset
 eval_strategy: steps
 eval_steps: 200
-per_device_eval_batch_size: 1
-eval_accumulation_steps: 1
+use_vllm_eval: true
+vllm_eval_max_model_len: 32800
+vllm_eval_gpu_util: 0.6
+vllm_eval_tp_size: 1
+vllm_eval_batch_size: 1
 
 ### dataset
 dataset: osworld_agentnet_reward,scalecua_reward

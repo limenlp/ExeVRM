@@ -11,20 +11,24 @@ video_max_pixels: 921600  # 1280*720
 video_min_pixels: 1
 trust_remote_code: true
 template: qwen3_vl_nothink
-# template: qwen2_vl
+# template: qwen2_vl  # enable when testing Qwen2.5-VL-7B-Instruct
 
 ### method
 stage: sft
 
 ### dataset
 do_eval: true
+use_vllm_eval: true
 predict_with_generate: true
 eval_dataset: osworld_agentnet_testset_720p,scalecua_testset
 cutoff_len: 128000
 overwrite_cache: true
 preprocessing_num_workers: 16
 preprocessing_batch_size: 200
-max_new_tokens: 128
+vllm_eval_max_model_len: 32800
+vllm_eval_gpu_util: 0.6
+vllm_eval_tp_size: 1
+vllm_eval_batch_size: 1
 
 ### output
 eval_save_predictions: true
