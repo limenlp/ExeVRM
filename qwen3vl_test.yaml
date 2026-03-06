@@ -1,0 +1,39 @@
+### model
+# model_name_or_path: lime-nlp/VERM-8B
+model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
+# model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct
+# model_name_or_path: ShijianW01/Video-Thinker-7B
+# model_name_or_path: Video-R1/Video-R1-7B
+
+video_fps: 1.0
+video_maxlen: 100
+video_max_pixels: 921600  # 1280*720
+video_min_pixels: 1
+trust_remote_code: true
+template: qwen3_vl_nothink
+# template: qwen2_vl
+
+### method
+stage: sft
+
+### dataset
+do_eval: true
+predict_with_generate: true
+eval_dataset: osworld_agentnet_testset_720p,scalecua_testset
+cutoff_len: 128000
+overwrite_cache: true
+preprocessing_num_workers: 16
+preprocessing_batch_size: 200
+max_new_tokens: 128
+
+### output
+eval_save_predictions: true
+compute_video_reward_cumulative_accuracy: true
+eval_predictions_output_dir: /export/home/VideoRM/eval_res
+overwrite_output_dir: true
+
+### eval
+per_device_eval_batch_size: 1
+eval_accumulation_steps: 1
+ddp_timeout: 180000000
+flash_attn: fa2

@@ -1,0 +1,50 @@
+{
+  "benchmark_single_video": {
+    "file_name": "benchmark_single_video/data.jsonl",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "videos": "videos"
+    }
+  },
+  "osworld_agentnet_reward": {
+    "file_name": "osworld_agentnet_training/original/shards",
+    "formatting": "sharegpt",
+    "use_stp": null,
+    "use_ttp": null,
+    "columns": {
+      "messages": "conversations",
+      "videos": "videos"
+    }
+  },
+  "scalecua_reward": {
+    "file_name": "scalecua_training/original/shards",
+    "formatting": "sharegpt",
+    "use_stp": null,
+    "use_ttp": null,
+    "columns": {
+      "messages": "conversations",
+      "videos": "videos"
+    }
+  },
+  "scalecua_testset": {
+    "file_name": "scalecua_testset.jsonl",
+    "formatting": "sharegpt",
+    "use_stp": false,
+    "use_ttp": false,
+    "columns": {
+      "messages": "conversations",
+      "videos": "videos"
+    }
+  },
+  "osworld_agentnet_testset": {
+    "file_name": "osworld_agentnet_testset_720p.jsonl",
+    "formatting": "sharegpt",
+    "use_stp": false,
+    "use_ttp": false,
+    "columns": {
+      "messages": "conversations",
+      "videos": "videos"
+    }
+  }
+}

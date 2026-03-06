@@ -1,0 +1,78 @@
+### model
+model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
+image_max_pixels: 921600  # 1280*720
+
+video_fps: 1.0
+video_maxlen: 50
+video_max_pixels: 921600  # 1280*720
+video_min_pixels: 1
+trust_remote_code: true
+
+
+### stp parameters
+use_stp: true
+stp_mode: forward_removal
+stp_patch_level: true
+stp_threshold: 3  # patch similarity threshold
+stp_skip_ratio: 0
+stp_large_comp_threshold: 10  # Skip components with >30 connected patches
+# This runs STP on each raw temporal frame and ORs the keep masks.
+use_raw_frames_in_stp: true
+
+
+### Temporal token removal
+use_ttp: true
+ttp_threshold: 0.9999  # Cosine similarity threshold (higher = more aggressive removal)
+ttp_similarity_metric: cosine  # choices: [cosine, l2, l1]
+
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+freeze_vision_tower: true
+freeze_multi_modal_projector: true
+freeze_language_model: false
+deepspeed: deepspeed/z2.json
+
+### evaluation
+do_eval: true
+predict_with_generate: true
+eval_dataset: osworld_agentnet_testset,scalecua_testset
+eval_strategy: steps
+eval_steps: 200
+per_device_eval_batch_size: 1
+eval_accumulation_steps: 1
+
+### dataset
+dataset: osworld_agentnet_reward,scalecua_reward
+template: qwen3_vl_nothink
+cutoff_len: 128000
+overwrite_cache: false
+preprocessing_num_workers: 200
+preprocessing_batch_size: 2
+dataloader_num_workers: 16
+
+### output
+output_dir: save_models/qwen3vl-8b/full/qwen3-vl-8B--720p-stp-ttp-hybrid-scalecua-50frames--5
+
+logging_steps: 1
+save_steps: 200
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: wandb  # choices: [none, wandb, tensorboard, swanlab, mlflow]
+run_name: qwen3-vl-8B--720p-stp-ttp-hybrid-scalecua-50frames--5
+
+### train
+compute_video_reward_cumulative_accuracy: true
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2
+learning_rate: 5.0e-6
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+flash_attn: fa2
