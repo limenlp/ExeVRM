@@ -271,14 +271,15 @@ def patch_qwen3_vl_generation():
         # This corrupts the output and prevents EOS generation.
         # Fix: rebuild attention_mask from the Step-5 shortened mask, and set
         # cache_position to the actual KV-cache length each decode step.
-        if is_first_iteration:
+        _is_prefill = cache_position is None or cache_position[0] == 0
+        if _is_prefill:
             # Clear stale mask from previous batch
             if hasattr(self.model, '_ttp_step5_attn_mask'):
                 delattr(self.model, '_ttp_step5_attn_mask')
         # Build the rebuilt mask for attention (but do NOT replace attention_mask yet —
         # GenerationMixin needs the ORIGINAL mask for correct position_ids via cumsum).
         _ttp_rebuilt_attn_mask = None
-        if not is_first_iteration:
+        if not _is_prefill:
             _step5_mask = getattr(self.model, '_ttp_step5_attn_mask', None)
             if _step5_mask is not None and past_key_values is not None:
                 _actual_cache_len = past_key_values.get_seq_length()
@@ -346,7 +347,7 @@ def patch_qwen3_vl_generation():
             text_positions = model_inputs["position_ids"][None, ...]
             model_inputs["position_ids"] = torch.cat([text_positions, vision_positions], dim=0)
 
-        if not is_first_iteration and use_cache:
+        if cache_position is not None and cache_position[0] != 0:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
             model_inputs["video_ttp_keep_mask"] = None
@@ -359,7 +360,7 @@ def patch_qwen3_vl_generation():
         # the actual KV-cache length, so the model only attends to real entries.
         if _ttp_rebuilt_attn_mask is not None:
             model_inputs["attention_mask"] = _ttp_rebuilt_attn_mask
-        elif is_first_iteration and _original_2d_attn_mask is not None:
+        elif _is_prefill and _original_2d_attn_mask is not None:
             # During prefill, GenerationMixin step 6 may have converted the 2D
             # mask to 4D.  patched_forward's Step 5 requires 2D for token
             # filtering, so restore the original 2D mask.

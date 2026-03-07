@@ -37,11 +37,9 @@ predict_with_generate: true
 eval_dataset: osworld_agentnet_testset,scalecua_testset
 eval_strategy: steps
 eval_steps: 200
-use_vllm_eval: true
-vllm_eval_max_model_len: 32800
-vllm_eval_gpu_util: 0.6
-vllm_eval_tp_size: 1
-vllm_eval_batch_size: 1
+per_device_eval_batch_size: 1
+eval_accumulation_steps: 1
+max_new_tokens: 256
 
 ### dataset
 dataset: osworld_agentnet_reward,scalecua_reward

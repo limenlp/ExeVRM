@@ -1,3 +1,24 @@
+"""
+Spatial Token Pruning (STP) — removes spatially redundant visual tokens.
+
+Core idea: build a UI-graph by Union-Find over adjacent patches whose pixel
+difference is below a threshold. Connected components represent visually
+uniform regions (e.g. backgrounds).  Representative tokens are sampled
+from each component (boundary-aware for large regions), while the rest
+are pruned.  This reduces the visual token count while preserving fine
+UI details like buttons, text, and icons.
+
+Implementations:
+  - CPU path: NumPy-based Union-Find + linspace sampling (robust, slower).
+  - GPU path: iterative label-propagation Union-Find in pure PyTorch (fast,
+    no CPU transfer).  Falls back to CPU on error.
+  - Patch-level mode: runs STP at individual patch resolution (e.g. 48×48)
+    then maps to merged token level via configurable strategy (any/all/majority).
+
+Caching: keep masks are cached by (pixel_hash, config_tuple) to avoid
+recomputation for identical inputs (e.g. during gradient accumulation).
+"""
+
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -13,19 +34,15 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
-# ============================================================================
-# PERFORMANCE OPTIMIZATION: Caching and GPU-accelerated computation
-# ============================================================================
-
-# Global cache for keep masks (keyed by pixel_values hash)
+# ---------------------------------------------------------------------------
+# Keep-mask cache (avoids recomputation for identical pixel_values + config)
+# ---------------------------------------------------------------------------
 _keep_mask_cache: dict[int, torch.Tensor] = {}
 _CACHE_MAX_SIZE = 32  # Maximum number of cached masks
 
 
 def _get_pixel_hash(pixel_values: torch.Tensor) -> int:
-    """Compute a hash for pixel values for caching purposes."""
-    # Use a fast hash based on shape, first/last values, and sum
-    # This is not collision-proof but is fast for caching
+    """Fast (non-collision-proof) hash of pixel tensor for cache keying."""
     shape_hash = hash(pixel_values.shape)
     if pixel_values.numel() > 0:
         # Sample a few values for hash
@@ -54,12 +71,7 @@ def _get_keep_mask_cache_key(
     temporal_aggregation: str,
     use_raw_frames_in_stp: bool,
 ) -> int:
-    """Compute a cache key for keep mask computation.
-
-    IMPORTANT: the keep mask depends not only on pixel_values but also on
-    configuration knobs (threshold/skip_ratio/etc.).
-    """
-    # Pixel hash dominates the key; include config to prevent incorrect reuse.
+    """Cache key combining pixel hash and all config knobs."""
     pv_hash = _get_pixel_hash(pixel_values)
     cfg = (
         float(threshold),
@@ -78,10 +90,9 @@ def _get_keep_mask_cache_key(
 
 
 def _cache_keep_mask(key: int, mask: torch.Tensor) -> None:
-    """Cache a keep mask with LRU eviction."""
+    """Cache a keep mask with FIFO eviction."""
     global _keep_mask_cache
     if len(_keep_mask_cache) >= _CACHE_MAX_SIZE:
-        # Remove oldest entry (simple FIFO, not true LRU)
         oldest_key = next(iter(_keep_mask_cache))
         del _keep_mask_cache[oldest_key]
     _keep_mask_cache[key] = mask.detach()
@@ -98,29 +109,22 @@ def clear_stp_cache() -> None:
     _keep_mask_cache.clear()
 
 
-# ============================================================================
-# GPU-ACCELERATED Union-Find using PyTorch
-# ============================================================================
+# ---------------------------------------------------------------------------
+# GPU-accelerated Union-Find (iterative label propagation, pure PyTorch)
+# ---------------------------------------------------------------------------
 
 def _gpu_union_find(
     grid_h: int,
     grid_w: int,
-    diffs_h: torch.Tensor,  # (grid_h-1, grid_w) vertical diffs
-    diffs_w: torch.Tensor,  # (grid_h, grid_w-1) horizontal diffs
+    diffs_h: torch.Tensor,  # (grid_h-1, grid_w)
+    diffs_w: torch.Tensor,  # (grid_h, grid_w-1)
     threshold: float,
 ) -> torch.Tensor:
     """
-    GPU-accelerated Union-Find using iterative label propagation.
+    Bidirectional label propagation on a 2D grid.
 
-    Uses a simple but robust approach: repeatedly propagate minimum labels
-    to connected neighbors until convergence.
-
-    The number of iterations is fixed to (grid_h + grid_w), which is the
-    theoretical worst-case diameter for bidirectional propagation on a 2-D grid.
-    This avoids torch.equal() which forces a CPU-GPU sync on every iteration.
-
-    Returns:
-        Component labels with shape (grid_h * grid_w,)
+    Fixed ``grid_h + grid_w`` iterations (worst-case diameter) with no
+    CPU-GPU sync.  Returns component labels ``(grid_h * grid_w,)``.
     """
     device = diffs_h.device if diffs_h.numel() > 0 else diffs_w.device
     num_patches = grid_h * grid_w
@@ -166,26 +170,11 @@ def _gpu_union_find(
 
 
 def _get_select_mask_gpu(
-    labels: torch.Tensor,  # (num_patches,) component labels
+    labels: torch.Tensor,  # (num_patches,)
     skip_ratio: float,
     large_comp_threshold: int,
 ) -> torch.Tensor:
-    """
-    GPU-accelerated selection mask computation.
-
-    This implementation matches the CPU version (_get_select_mask_stp) exactly:
-    - Uses uniform sampling (linspace) to select tokens within each component
-    - Single-patch components are always kept
-    - Large components (> large_comp_threshold) are entirely skipped
-
-    Args:
-        labels: Component labels for each patch
-        skip_ratio: Ratio of patches to skip within each component
-        large_comp_threshold: Components larger than this are entirely skipped
-
-    Returns:
-        Boolean mask where True = keep
-    """
+    """GPU selection mask: linspace sampling per component, matching CPU logic."""
     device = labels.device
     num_patches = labels.shape[0]
 
@@ -279,20 +268,7 @@ def _compute_keep_mask_gpu_single_frame(
     skip_ratio: float,
     large_comp_threshold: int,
 ) -> torch.Tensor:
-    """
-    Compute keep mask for a single frame using GPU-accelerated operations.
-
-    Args:
-        patches: Flattened patch tensor with shape (grid_h, grid_w, patch_dim)
-        grid_h: Height of the grid
-        grid_w: Width of the grid
-        threshold: Threshold for merging similar patches
-        skip_ratio: Ratio of patches to skip
-        large_comp_threshold: Skip components larger than this
-
-    Returns:
-        Boolean mask with shape (grid_h * grid_w,) where True = keep
-    """
+    """Single-frame GPU keep mask: pairwise diffs → Union-Find → selection."""
     device = patches.device
 
     # Compute pairwise differences on GPU
@@ -331,31 +307,17 @@ def compute_token_keep_mask_from_pixels_gpu(
     use_raw_frames_in_stp: bool = False,
 ) -> torch.Tensor:
     """
-    GPU-accelerated version of compute_token_keep_mask_from_pixels.
+    GPU-accelerated token-level STP keep mask (no CPU transfer).
 
-    This function performs all computations on GPU without CPU transfers,
-    providing significant speedup for inference.
+    Processes each temporal slice: reshapes patches to merge-block order,
+    optionally handles raw-frame STP, and produces a boolean keep mask.
 
     Args:
-        pixel_values: Tensor with shape (total_patches, patch_dim)
-        grid_thw: Tensor with shape (num_images, 3) containing (t, h, w)
-        threshold: Patch similarity threshold
-        skip_ratio: Ratio of patches to skip
-        large_comp_threshold: Skip components larger than this
-        patch_size: Size of each patch
-        temporal_patch_size: Temporal patch size
-        merge_size: Spatial merge size
-        channel: Number of image channels
-        temporal_aggregation: How to handle temporal patches for edge detection:
-            - "first": Use only the first temporal frame (recommended for video)
-            - "mean": Average across temporal frames
-            - "all": Use all temporal frames concatenated (original behavior)
-        use_raw_frames_in_stp: If True and temporal_patch_size>1, build a UI graph per raw
-            temporal frame (within each temporal patch group) and OR the resulting keep masks.
-            This tends to preserve small/boundary components that appear in any raw frame.
+        temporal_aggregation: ``first`` (recommended for video), ``mean``, or ``all``.
+        use_raw_frames_in_stp: OR keep masks across raw temporal frames.
 
     Returns:
-        Boolean mask where True = keep, False = remove
+        Boolean mask ``(total_merged_tokens,)`` — ``True`` = keep.
     """
     device = pixel_values.device
 
@@ -446,24 +408,7 @@ def _map_patch_mask_to_token_mask_gpu(
     merge_size: int = 2,
     strategy: str = "any",
 ) -> torch.Tensor:
-    """
-    GPU version of _map_patch_mask_to_token_mask.
-
-    Map patch-level keep mask to merged token-level mask.
-
-    Args:
-        patch_mask: Boolean mask at patch level, shape (grid_h * grid_w,)
-        grid_h: Full height of patch grid (e.g., 48)
-        grid_w: Full width of patch grid (e.g., 48)
-        merge_size: Merge factor (e.g., 2 means 2x2 patches -> 1 token)
-        strategy: How to combine patch decisions:
-            - "any": Keep token if ANY of its patches are kept
-            - "all": Keep token only if ALL of its patches are kept
-            - "majority": Keep token if more than half of its patches are kept
-
-    Returns:
-        Boolean mask at token level, shape (out_h * out_w,)
-    """
+    """Map patch-level keep mask to merged-token-level via ``any``/``all``/``majority``."""
     out_h = grid_h // merge_size
     out_w = grid_w // merge_size
 
@@ -504,28 +449,11 @@ def compute_token_keep_mask_from_pixels_gpu_patch_level(
     use_raw_frames_in_stp: bool = False,
 ) -> torch.Tensor:
     """
-    GPU-accelerated version for patch-level STP analysis.
-
-    This function performs STP analysis at individual patch level (e.g., 48x48)
-    instead of merged token level (e.g., 24x24), then maps the results to token level.
-
-    Args:
-        pixel_values: Tensor with shape (total_patches, patch_dim)
-        grid_thw: Tensor with shape (num_images, 3) containing (t, h, w)
-        threshold: Patch similarity threshold
-        skip_ratio: Ratio of patches to skip
-        large_comp_threshold: Skip components larger than this (at token level)
-        patch_size: Size of each patch
-        temporal_patch_size: Temporal patch size
-        merge_size: Spatial merge size
-        channel: Number of image channels
-        patch_to_token_strategy: How to map patch decisions to tokens ("any", "all", "majority")
-        temporal_aggregation: How to handle temporal patches ("first", "mean", "all")
-        use_raw_frames_in_stp: If True and temporal_patch_size>1, run patch-level STP on
-            each raw temporal frame (within each temporal patch group) and OR the keep masks.
+    GPU-accelerated patch-level STP: finer granularity (e.g. 48×48) then
+    mapped to token level via ``patch_to_token_strategy``.
 
     Returns:
-        Boolean mask where True = keep, False = remove (at token level)
+        Boolean mask ``(total_merged_tokens,)`` — ``True`` = keep.
     """
     device = pixel_values.device
 
@@ -637,7 +565,7 @@ def compute_token_keep_mask_from_pixels_gpu_patch_level(
 
 
 class UnionFind:
-    """Union-Find data structure for constructing UI patches."""
+    """Union-Find with path compression for CPU-based UI-graph construction."""
 
     def __init__(self, size: int):
         self.parent = np.arange(size)
@@ -663,20 +591,17 @@ def build_ui_graph(
     max_component_ratio: float = 0.5,
 ) -> np.ndarray:
     """
-    Build UI graph by merging similar adjacent patches using Union-Find.
+    Build UI-graph: merge adjacent patches below threshold via Union-Find.
 
-    Args:
-        patches: Patch array with shape (num_patches, patch_dim)
-        grid_h: Height grid count
-        grid_w: Width grid count
-        threshold: Patch-wise difference threshold for merging.
-            If threshold > 0, uses fixed threshold.
-            If threshold < 0, uses adaptive threshold at the |threshold| percentile.
-        adaptive: If True, automatically reduce threshold if largest component is too large
-        max_component_ratio: Maximum allowed ratio for largest component (only used if adaptive=True)
+    Threshold semantics:
+      - ``> 0``: fixed L2-norm threshold.
+      - ``< 0``: adaptive — use the ``|threshold|``-th percentile of diffs.
+
+    Adaptive mode iteratively lowers the threshold if the largest component
+    exceeds ``max_component_ratio`` of total patches.
 
     Returns:
-        UI graph assignment array with shape (grid_h * grid_w,)
+        Component assignment array ``(grid_h * grid_w,)`` with consecutive IDs.
     """
     num_patches = grid_h * grid_w
 
@@ -757,29 +682,16 @@ def get_select_mask(
     grid_w: int | None = None,
 ) -> np.ndarray:
     """
-    Get selection mask based on patch assignment.
+    Compute a boolean keep mask from UI-graph component assignments.
 
-    Extended STP logic with large component threshold:
-    - Small components (size <= large_comp_threshold): Apply small_comp_skip_ratio (default 0 = keep all)
-    - Large components (size > large_comp_threshold): Apply large_comp_skip_ratio (default = skip_ratio)
-    - Single-patch components are always kept
-    - If large_comp_threshold=0, apply skip_ratio to all components (original STP behavior)
-
-    For large components, we prioritize keeping boundary tokens (tokens at component edges)
-    rather than uniform sampling, as boundaries contain more semantic information.
-
-    Args:
-        patch_assign: 1D array of component assignments for each patch
-        skip_ratio: Default ratio of patches to skip (0.0 to 1.0), used when threshold=0
-        large_comp_threshold: Components with size <= this are "small" (0 = disabled)
-        min_keep_ratio: Minimum ratio of tokens to keep (safety mechanism)
-        small_comp_skip_ratio: Skip ratio for small components (default 0 = keep all)
-        large_comp_skip_ratio: Skip ratio for large components (default None = use skip_ratio)
-        grid_h: Grid height (optional, for boundary-aware sampling)
-        grid_w: Grid width (optional, for boundary-aware sampling)
+    Selection strategy:
+      - Single-patch components: always kept.
+      - Small components (size <= ``large_comp_threshold``): ``small_comp_skip_ratio``.
+      - Large components: boundary-aware sampling with ``large_comp_skip_ratio``.
+      - ``large_comp_threshold=0``: uniform ``skip_ratio`` for all (original STP).
 
     Returns:
-        Boolean mask indicating which patches to keep
+        Boolean mask ``(len(patch_assign),)`` — ``True`` = keep.
     """
     retain_mask = np.zeros(len(patch_assign), dtype=bool)
     unique_components = np.unique(patch_assign)
@@ -849,21 +761,11 @@ def _boundary_aware_sampling(
     grid_w: int,
     num_to_retain: int,
 ) -> np.ndarray:
-    """
-    Sample tokens from a component, prioritizing boundary tokens.
+    """Sample ``num_to_retain`` tokens, prioritising component-boundary positions.
 
-    Boundary tokens are those adjacent to tokens from different components,
-    as they contain more semantic information (edges, transitions).
-
-    Args:
-        positions: Array of position indices belonging to this component
-        patch_assign: Full assignment array
-        grid_h: Grid height
-        grid_w: Grid width
-        num_to_retain: Number of tokens to retain
-
-    Returns:
-        Array of position indices to retain
+    Boundary tokens (adjacent to different components) carry more semantic
+    information.  All boundaries are kept first; remaining quota is filled
+    by uniform interior sampling.
     """
     if len(positions) <= num_to_retain:
         return positions
@@ -933,25 +835,9 @@ def apply_stp_token_selection(
     large_comp_threshold: int = 0,
 ) -> tuple["torch.Tensor", "torch.Tensor", int, list[np.ndarray]]:
     """
-    Apply STP-style UI-guided visual token selection.
+    CPU-based STP token selection: UI-graph → component sampling → pruned pixels.
 
-    This implements the core STP idea: use UI graph to identify similar regions,
-    then selectively keep representative tokens from each component.
-
-    Args:
-        pixel_values: Tensor with shape (total_patches, patch_dim)
-        image_grid_thw: Tensor with shape (num_images, 3) containing (t, h, w) for each image
-        threshold: Patch similarity threshold for UI graph construction
-        skip_ratio: Ratio of patches to skip within each component (0.0 to 1.0)
-        merge_size: Merge size used by the vision encoder (default 2)
-        large_comp_threshold: Components larger than this are fully skipped (0 = disabled)
-
-    Returns:
-        Tuple of:
-        - selected_pixel_values: Tensor with selected patches
-        - original_grid_thw: Original grid dimensions (unchanged for reference)
-        - num_reduced: Number of tokens reduced
-        - select_masks: List of selection masks for each image (for visualization)
+    Returns ``(selected_pixel_values, original_grid_thw, num_reduced, select_masks)``.
     """
     if threshold <= 0.0:
         return pixel_values, image_grid_thw, 0, []
@@ -1028,24 +914,9 @@ def apply_stp_token_selection_with_positions(
     large_comp_threshold: int = 0,
 ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", int]:
     """
-    Apply STP-style token selection and return position indices for selected tokens.
+    STP token selection returning ``(t, h, w)`` positions for custom position encoding.
 
-    This function performs true UI-guided token selection and returns the (t, h, w)
-    position of each selected token, enabling custom position encoding.
-
-    Args:
-        pixel_values: Tensor with shape (total_patches, patch_dim)
-        image_grid_thw: Tensor with shape (num_images, 3) containing (t, h, w) for each image
-        threshold: Patch similarity threshold for UI graph construction
-        skip_ratio: Ratio of patches to skip within each component (0.0 to 1.0)
-        large_comp_threshold: Components larger than this are fully skipped (0 = disabled)
-
-    Returns:
-        Tuple of:
-        - selected_pixel_values: Tensor with shape (num_selected, patch_dim)
-        - selected_positions: Tensor with shape (num_selected, 3) containing (t, h, w) for each token
-        - num_selected_per_image: Tensor with shape (num_images,) containing count of selected tokens
-        - num_reduced: Total number of tokens reduced
+    Returns ``(selected_pixel_values, selected_positions, num_selected_per_image, num_reduced)``.
     """
     if threshold <= 0.0:
         # No reduction - return all tokens with their positions
@@ -1148,29 +1019,13 @@ def apply_stp_token_reduction(
     merge_size: int = 2,
 ) -> tuple["torch.Tensor", "torch.Tensor", int]:
     """
-    Apply STP-style UI-guided token reduction while maintaining grid structure.
+    STP token reduction via adaptive 2×2 block-wise pooling.
 
-    This implements true UI-guided selection with grid compatibility:
-    1. Build UI graph to identify similar patches (components)
-    2. For large uniform components (backgrounds), apply aggressive pooling
-    3. For small/detailed components (UI elements), preserve more detail
-    4. Maintain grid structure for Qwen2VL's mrope position encoding
+    Preserves grid structure for M-RoPE: large uniform components get
+    simple-average pooling; small/detailed components use variance-weighted
+    pooling to preserve edges.
 
-    The key insight: instead of random selection, we use adaptive block-wise pooling
-    where the pooling factor depends on local UI complexity.
-
-    Args:
-        pixel_values: Tensor with shape (total_patches, patch_dim)
-        image_grid_thw: Tensor with shape (num_images, 3) containing (t, h, w) for each image
-        threshold: Patch similarity threshold for UI graph construction
-        skip_ratio: Target skip ratio for uniform regions (0.0 to 1.0)
-        merge_size: Merge size used by the vision encoder (default 2)
-
-    Returns:
-        Tuple of:
-        - reduced_pixel_values: Tensor with reduced patches
-        - reduced_grid_thw: Updated grid dimensions
-        - num_reduced: Number of tokens reduced
+    Returns ``(reduced_pixel_values, reduced_grid_thw, num_reduced)``.
     """
     if threshold <= 0.0:
         return pixel_values, image_grid_thw, 0
@@ -1313,24 +1168,9 @@ def apply_stp_embedding_selection(
     large_comp_threshold: int = 0,
 ) -> tuple["torch.Tensor", "torch.Tensor", int]:
     """
-    Apply STP-style token selection on visual embeddings (after visual encoder).
+    Post-encoder STP: select representative tokens from vision embeddings.
 
-    This function is designed to be used AFTER the visual encoder has processed
-    all patches and generated embeddings. It selects representative tokens based
-    on embedding similarity.
-
-    Args:
-        embeddings: Tensor with shape (total_tokens, hidden_dim) - visual embeddings
-        grid_thw: Tensor with shape (num_images, 3) containing (t, h, w) for each image
-        threshold: Embedding similarity threshold for component construction
-        skip_ratio: Ratio of tokens to skip within each component (0.0 to 1.0)
-        large_comp_threshold: Components larger than this are fully skipped (0 = disabled)
-
-    Returns:
-        Tuple of:
-        - selected_embeddings: Tensor with selected embeddings
-        - selection_indices: Tensor with indices of selected tokens (for position tracking)
-        - num_reduced: Number of tokens reduced
+    Returns ``(selected_embeddings, selection_indices, num_reduced)``.
     """
     if threshold <= 0.0:
         indices = torch.arange(embeddings.shape[0], device=embeddings.device)
@@ -1417,7 +1257,7 @@ def apply_stp_embedding_selection(
     return selected_embeddings, selection_indices, num_reduced
 
 
-# Global storage for STP config (used by hooks)
+# Global STP config (used by patched get_image_features hook)
 _stp_config: dict = {}
 
 
@@ -1428,23 +1268,7 @@ def get_stp_mask_for_embeddings(
     skip_ratio: float = 0.5,
     large_comp_threshold: int = 0,
 ) -> "torch.Tensor":
-    """
-    Get a boolean mask indicating which embeddings should be masked (set to zero/placeholder).
-
-    This function computes which visual tokens should be "skipped" based on UI similarity,
-    returning a mask that can be used to zero out or replace those embeddings while
-    preserving the grid structure and position encoding.
-
-    Args:
-        embeddings: Tensor with shape (total_tokens, hidden_dim) - visual embeddings
-        grid_thw: Tensor with shape (num_images, 3) containing (t, h, w) for each image
-        threshold: Embedding similarity threshold for component construction
-        skip_ratio: Ratio of tokens to skip within each component (0.0 to 1.0)
-        large_comp_threshold: Components larger than this are fully skipped (0 = disabled)
-
-    Returns:
-        Boolean mask tensor with shape (total_tokens,) - True means the token should be masked
-    """
+    """Compute skip mask for embedding-level masking (True = should be zeroed)."""
     if threshold <= 0.0:
         return torch.zeros(embeddings.shape[0], dtype=torch.bool, device=embeddings.device)
 
@@ -1500,19 +1324,10 @@ def patch_stp_visual_encoder_with_masking(
     model_args: "ModelArguments",
 ) -> None:
     """
-    Patch the visual encoder to apply STP token masking after embedding generation.
+    Patch ``get_image_features`` to zero-out STP-pruned token embeddings.
 
-    This approach preserves grid structure and position encoding by:
-    1. Computing which tokens should be "skipped" based on UI similarity
-    2. Masking (zeroing out) the skipped tokens' embeddings
-    3. Keeping all tokens in place so position IDs remain correct
-
-    This is different from token removal - the masked tokens still exist but
-    carry no information, effectively making them "invisible" to the model.
-
-    Args:
-        model: The pretrained VLM model
-        model_args: Model arguments containing STP configuration
+    Unlike token-removal mode, this preserves the grid structure and
+    position encoding — masked tokens still exist but carry no information.
     """
     if not getattr(model_args, "use_stp", False):
         return
@@ -1531,7 +1346,7 @@ def patch_stp_visual_encoder_with_masking(
         logger.warning_rank0(f"STP visual encoder masking is not supported for model type: {model_type}")
         return
 
-    # Store config globally for use in hooks
+    # Store config for patched_get_image_features closure
     _stp_config["threshold"] = threshold
     _stp_config["skip_ratio"] = getattr(model_args, "stp_skip_ratio", 0.5)
     _stp_config["large_comp_threshold"] = large_comp_threshold
@@ -1540,13 +1355,12 @@ def patch_stp_visual_encoder_with_masking(
     _stp_config["temporal_aggregation"] = getattr(model_args, "stp_temporal_aggregation", "first")
     _stp_config["use_raw_frames_in_stp"] = getattr(model_args, "use_raw_frames_in_stp", False)
 
-    # Get the model's internal model (handles different transformers versions)
     if hasattr(model, "model"):
         inner_model = model.model
     else:
         inner_model = model
 
-    # Get vision encoder parameters from model config
+    # Vision encoder parameters from model config
     vision_config = getattr(model.config, "vision_config", None)
     if vision_config is not None:
         _stp_config["patch_size"] = getattr(vision_config, "patch_size", 14)
@@ -1558,7 +1372,7 @@ def patch_stp_visual_encoder_with_masking(
         _stp_config["temporal_patch_size"] = 2
         _stp_config["in_channels"] = 3
 
-    # Get merge_size from image processor if available
+    # Merge size from vision module
     if hasattr(inner_model, "visual") and hasattr(inner_model.visual, "merge_size"):
         _stp_config["merge_size"] = inner_model.visual.merge_size
     else:
@@ -1566,14 +1380,12 @@ def patch_stp_visual_encoder_with_masking(
 
     _stp_config["channel"] = _stp_config.get("in_channels", 3)
 
-    # Patch get_image_features method to apply masking
     original_get_image_features = inner_model.get_image_features
 
     def patched_get_image_features(pixel_values, grid_thw):
-        # Call original method
         result = original_get_image_features(pixel_values, grid_thw)
 
-        # Handle different return types (Qwen2VL vs Qwen3VL)
+        # Unpack return type (tuple for Qwen3VL, tensor for Qwen2VL)
         if isinstance(result, tuple):
             image_embeds = result[0]
             extra = result[1:]
@@ -1581,10 +1393,8 @@ def patch_stp_visual_encoder_with_masking(
             image_embeds = result
             extra = None
 
-        # Apply STP masking on embeddings (zero out skipped tokens)
+        # Zero out skipped tokens via pixel-based UI graph
         if _stp_config.get("large_comp_threshold", 0) > 0:
-            # Use pixel-based UI graph construction (STP original approach)
-            # This is more accurate than embedding-based construction
             keep_mask = compute_token_keep_mask_from_pixels(
                 pixel_values=pixel_values,
                 grid_thw=grid_thw,
@@ -1600,11 +1410,7 @@ def patch_stp_visual_encoder_with_masking(
                 use_raw_frames_in_stp=_stp_config.get("use_raw_frames_in_stp", False),
             )
 
-            # Invert to get skip mask (True = should be masked/skipped)
             skip_mask = ~keep_mask
-
-            # Zero out the masked embeddings
-            # This preserves grid structure while "hiding" redundant tokens
             if skip_mask.any():
                 image_embeds = image_embeds.clone()
                 image_embeds[skip_mask] = 0.0
@@ -1612,12 +1418,10 @@ def patch_stp_visual_encoder_with_masking(
                 _stp_config["last_num_masked"] = num_masked
 
         if extra is not None:
-            # For Qwen3VL which returns (image_embeds, deepstack_embeds)
-            # We also need to mask deepstack_embeds if present
+            # Also mask deepstack_embeds if present (Qwen3VL)
             if len(extra) > 0 and extra[0] is not None:
                 deepstack = extra[0]
                 if "last_num_masked" in _stp_config and _stp_config["last_num_masked"] > 0:
-                    # Apply same mask to deepstack
                     if deepstack.shape[0] == image_embeds.shape[0]:
                         deepstack = deepstack.clone()
                         deepstack[skip_mask] = 0.0
@@ -1638,16 +1442,7 @@ def get_image_token_indices(
     input_ids: "torch.Tensor",
     image_token_id: int,
 ) -> "torch.Tensor":
-    """
-    Get the indices of image tokens in the input sequence.
-
-    Args:
-        input_ids: Tensor with shape (batch, seq_len) or (seq_len,)
-        image_token_id: The token ID used as image placeholder
-
-    Returns:
-        Boolean mask with shape matching input_ids, True for image tokens
-    """
+    """Boolean mask of image-placeholder token positions."""
     return input_ids == image_token_id
 
 
@@ -1665,15 +1460,11 @@ def get_rope_index_with_stp(
     stp_video_token_positions: Optional["torch.LongTensor"] = None,
     stp_video_num_selected: Optional["torch.LongTensor"] = None,
 ) -> tuple["torch.Tensor", "torch.Tensor"]:
-    """Compute RoPE indices for Qwen-VL mRoPE when STP removed visual tokens in preprocessing.
+    """Compute M-RoPE position_ids when STP has removed visual tokens in preprocessing.
 
-    This is used by the data collator when mm preprocessing returns:
-    - `stp_token_positions` + `stp_num_selected` (for images)
-    - `stp_video_token_positions` + `stp_video_num_selected` (for videos)
-
-    The key idea: visual tokens are fewer (after removal), but each kept token still
-    carries its original (t,h,w) position, so we must build 3D position_ids from
-    these preserved positions.
+    Each surviving token retains its original ``(t, h, w)`` position from
+    ``stp_token_positions`` / ``stp_video_token_positions``, so 3D position_ids
+    are built from these preserved coordinates rather than from the grid shape.
     """
     # Check if we have STP position info
     use_stp_positions = stp_token_positions is not None and stp_num_selected is not None

@@ -12,17 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Temporal Token Pruning (TTP) for Video Transformers
+# Temporal Token Pruning (TTP) for Video Language Models
 """
-Temporal Token Pruning (TTP) for removing temporally repeated visual tokens.
+Temporal Token Pruning (TTP) — removes temporally redundant visual tokens from videos.
 
-The key idea: In videos, many patches are repeated across consecutive frames.
-TTP detects these "runs" of similar patches and removes duplicates, keeping only
-the first occurrence with positional encoding to represent the run length.
+Core idea: consecutive video frames share many identical patches. TTP compares
+adjacent (or reference-based) frames, detects "runs" of similar patches, and
+keeps only the first occurrence per run. This reduces the visual token count by
+50-90% for typical screen-recording videos with minimal information loss.
 
-This module can be used:
-1. Standalone - to remove temporally repeated tokens
-2. Combined with STP - first apply STP spatial reduction, then TTP temporal reduction
+Usage modes:
+  1. Standalone  — TTP-only temporal reduction (patch_qwen3vl_forward_with_ttp)
+  2. STP + TTP   — spatial reduction first, then temporal reduction (combined masks)
+
+Supported architectures: Qwen2-VL, Qwen2.5-VL, Qwen3-VL, Qwen3-VL-MoE
 """
 
 from typing import TYPE_CHECKING, Optional
@@ -55,32 +58,27 @@ def compute_run_length_keep_mask(
     comparison_mode: str = "reference",
 ) -> "torch.Tensor":
     """
-    Compute which tokens to keep based on Temporal Token Pruning.
+    Compute a per-token keep mask via Temporal Token Pruning.
 
-    Supports two comparison modes:
-    - 'reference': Each frame compares with the last kept frame (more aggressive removal).
-    - 'consecutive': True run-length tokenization - only compare adjacent frames,
-                     detect 'runs' of consecutive duplicates, and use min_run_length.
+    Two comparison modes are available:
+    - ``reference``:   compare each frame against the last *kept* frame (more aggressive).
+    - ``consecutive``: compare only adjacent frames — true run-length encoding.
 
     Args:
-        pixel_values: Flattened patch tensor from processor, shape (num_patches, patch_dim)
-        grid_thw: Grid dimensions for each image/video, shape (num_images, 3) with (t, h, w)
-        threshold: Similarity threshold. For cosine: tokens with similarity > threshold are duplicates.
-                   For L2/L1: tokens with distance < threshold are duplicates.
-        min_run_length: Minimum run length to trigger removal. Default 2 means any duplicate is removed.
-                        Only effective in 'consecutive' mode.
-        similarity_metric: 'cosine', 'l2', or 'l1'
-        patch_size: Size of each patch (e.g., 14 for ViT)
-        temporal_patch_size: Number of frames per temporal patch
-        merge_size: Spatial merge size (e.g., 2 for 2x2 merging)
-        channel: Number of channels
-        use_raw_frames_in_ttp: If True, compare at raw frame level before temporal merging.
-            Each raw frame within temporal_patch_size is compared separately, and the
-            keep decisions are ORed (keep if ANY raw frame differs).
-        comparison_mode: 'reference' (default) or 'consecutive'
+        pixel_values:      Flattened patch tensor, shape ``(num_patches, patch_dim)``.
+        grid_thw:          Per-image/video grid dims, shape ``(N, 3)`` with ``(t, h, w)``.
+        threshold:         Similarity threshold (cosine: ``>`` = duplicate; L2/L1: ``<`` = duplicate).
+        min_run_length:    Minimum consecutive duplicates to trigger removal (``consecutive`` mode only).
+        similarity_metric: One of ``cosine``, ``l2``, ``l1``.
+        patch_size:        ViT patch size (e.g. 14).
+        temporal_patch_size: Frames per temporal patch (e.g. 2).
+        merge_size:        Spatial merge factor (e.g. 2 → 2×2 patches merge into 1 token).
+        channel:           Image channels.
+        use_raw_frames_in_ttp: Compare at raw-frame level and OR the keep decisions.
+        comparison_mode:   ``reference`` (default) or ``consecutive``.
 
     Returns:
-        Boolean mask where True = keep, False = remove. Shape: (num_merged_tokens,)
+        Boolean mask ``(num_merged_tokens,)`` — ``True`` = keep.
     """
     device = pixel_values.device
     dtype = pixel_values.dtype
@@ -177,27 +175,15 @@ def _compute_ttp_keep_mask_reference(
     device: "torch.device",
 ) -> "torch.Tensor":
     """
-    Compute TTP keep mask using reference-based comparison (vectorised).
+    Reference-based TTP keep mask (vectorised over spatial positions).
 
-    Each frame compares with the last kept frame (reference frame).
-    This is more aggressive as it can remove tokens that are similar to
-    a non-adjacent kept frame.
-
-    The original implementation looped over spatial positions × temporal frames
-    (N × (t-1) Python iterations with a CUDA sync per iteration).  The vectorised
-    version loops only over temporal frames (t-1 iterations), processing all N
-    spatial positions at once with tensor operations and zero CUDA syncs.
-
-    Args:
-        merged_tokens: Token representations, shape (t, num_merged_per_frame, dim)
-        t: Number of temporal frames
-        num_merged_per_frame: Number of tokens per frame
-        threshold: Similarity threshold
-        similarity_metric: 'cosine', 'l2', or 'l1'
-        device: Torch device
+    Each frame is compared against the last *kept* frame (reference).
+    More aggressive than consecutive mode: can skip frames similar to
+    a distant reference.  Loops only over ``t-1`` temporal steps with
+    zero CUDA syncs (all N spatial positions processed in one tensor op).
 
     Returns:
-        Boolean mask of shape (t, num_merged_per_frame)
+        Boolean mask ``(t, num_merged_per_frame)`` — frame 0 is always kept.
     """
     # keep_mask[t, i] = True if token i at frame t should be kept
     # Frame 0 is always kept.
@@ -255,27 +241,14 @@ def _compute_ttp_keep_mask_consecutive(
     device: "torch.device",
 ) -> "torch.Tensor":
     """
-    Compute TTP keep mask using consecutive comparison (true run-length tokenization).
+    Consecutive-comparison TTP keep mask (true run-length encoding).
 
-    Only compare adjacent frames. Detect "runs" of consecutive duplicates, and only
-    remove tokens if the run length >= min_run_length. This is less aggressive but
-    more faithful to the original run-length encoding concept.
-
-    The original implementation used nested Python loops over spatial × temporal
-    positions (N × (t-1) iterations with CUDA sync per iteration).  The vectorised
-    version computes all consecutive similarities in a single tensor operation.
-
-    Args:
-        merged_tokens: Token representations, shape (t, num_merged_per_frame, dim)
-        t: Number of temporal frames
-        num_merged_per_frame: Number of tokens per frame
-        threshold: Similarity threshold
-        similarity_metric: 'cosine', 'l2', or 'l1'
-        min_run_length: Minimum run length to trigger removal (default 2 means any duplicate is removed)
-        device: Torch device
+    Only adjacent frames are compared — less aggressive but more faithful
+    to the RLE concept.  Fully vectorised: all ``(t-1) × N`` similarities
+    are computed in a single tensor operation.
 
     Returns:
-        Boolean mask of shape (t, num_merged_per_frame)
+        Boolean mask ``(t, num_merged_per_frame)``.
     """
     keep_mask = torch.ones(t, num_merged_per_frame, dtype=torch.bool, device=device)
 
@@ -317,24 +290,7 @@ def _compute_ttp_keep_mask_for_tokens(
     comparison_mode: str = "reference",
     min_run_length: int = 2,
 ) -> "torch.Tensor":
-    """
-    Compute TTP keep mask for a set of merged tokens.
-
-    This is a dispatcher function that calls the appropriate comparison method.
-
-    Args:
-        merged_tokens: Token representations, shape (t, num_merged_per_frame, dim)
-        t: Number of temporal frames
-        num_merged_per_frame: Number of tokens per frame
-        threshold: Similarity threshold
-        similarity_metric: 'cosine', 'l2', or 'l1'
-        device: Torch device
-        comparison_mode: 'reference' or 'consecutive'
-        min_run_length: Minimum run length for consecutive mode
-
-    Returns:
-        Boolean mask of shape (t, num_merged_per_frame)
-    """
+    """Dispatch to reference or consecutive TTP comparison."""
     if comparison_mode == "consecutive":
         return _compute_ttp_keep_mask_consecutive(
             merged_tokens, t, num_merged_per_frame, threshold,
@@ -351,18 +307,7 @@ def _apply_min_run_length(
     keep_mask: "torch.Tensor",
     min_run_length: int,
 ) -> "torch.Tensor":
-    """
-    Apply minimum run length constraint to keep mask.
-
-    Only remove tokens if they are part of a run of at least min_run_length duplicates.
-
-    Args:
-        keep_mask: Boolean mask of shape (t, num_tokens)
-        min_run_length: Minimum run length to trigger removal
-
-    Returns:
-        Updated keep mask
-    """
+    """Restore tokens in runs shorter than *min_run_length* (consecutive mode only)."""
     t, num_tokens = keep_mask.shape
     result = keep_mask.clone()
 
@@ -399,21 +344,10 @@ def compute_run_length_keep_mask_from_embeddings(
     merge_size: int = 2,
 ) -> "torch.Tensor":
     """
-    Compute TTP keep mask from vision embeddings (after vision encoder).
+    Compute TTP keep mask from post-encoder vision embeddings.
 
-    This is an alternative to pixel-based computation, useful when embeddings
-    are already available.
-
-    Args:
-        embeddings: Vision embeddings, shape (num_tokens, hidden_dim)
-        grid_thw: Grid dimensions for each image/video, shape (num_images, 3)
-        threshold: Similarity threshold for duplicate detection
-        min_run_length: Minimum run length to trigger removal
-        similarity_metric: 'cosine', 'l2', or 'l1'
-        merge_size: Spatial merge size
-
-    Returns:
-        Boolean mask where True = keep, False = remove
+    Alternative to pixel-based ``compute_run_length_keep_mask`` when
+    embeddings are already materialised (e.g. embedding-level TTP).
     """
     device = embeddings.device
     grid_thw_np = grid_thw.cpu().numpy()
@@ -473,19 +407,10 @@ def combine_stp_and_ttp_masks(
     stp_mask: Optional["torch.Tensor"],
     ttp_mask: Optional["torch.Tensor"],
 ) -> Optional["torch.Tensor"]:
-    """
-    Combine STP and TTP keep masks.
+    """AND-combine STP (spatial) and TTP (temporal) keep masks.
 
-    When both are provided, a token is kept only if BOTH masks say to keep it.
-    This allows STP to first remove spatially redundant tokens, then TTP
-    removes temporally redundant tokens from the remaining set.
-
-    Args:
-        stp_mask: STP keep mask (spatial reduction)
-        ttp_mask: TTP keep mask (temporal reduction)
-
-    Returns:
-        Combined keep mask, or None if both inputs are None
+    A token survives only if both masks say keep.  Returns ``None`` if
+    both inputs are ``None``.
     """
     if stp_mask is None and ttp_mask is None:
         return None
@@ -519,25 +444,10 @@ def compute_ttp_keep_mask_after_stp(
     channel: int = 3,
 ) -> "torch.Tensor":
     """
-    Compute TTP keep mask on tokens that survived STP filtering.
+    Compute TTP keep mask restricted to STP-surviving tokens.
 
-    This is used when combining STP (spatial) and TTP (temporal) reduction.
-    We only compare tokens that STP decided to keep.
-
-    Args:
-        pixel_values: Original pixel values
-        grid_thw: Grid dimensions
-        stp_keep_mask: Boolean mask from STP (True = kept by STP)
-        threshold: TTP similarity threshold
-        min_run_length: Minimum run length for TTP
-        similarity_metric: Similarity metric for TTP
-        patch_size: Patch size
-        temporal_patch_size: Temporal patch size
-        merge_size: Spatial merge size
-        channel: Number of channels
-
-    Returns:
-        Combined keep mask (STP AND TTP)
+    For each spatial position, only frames kept by STP are compared
+    temporally. Returns the AND-combined mask (STP ∩ TTP).
     """
     device = pixel_values.device
     grid_thw_np = grid_thw.cpu().numpy()
@@ -617,17 +527,7 @@ def patch_qwen2vl_forward_with_ttp(
     model: "PreTrainedModel",
     model_args: "ModelArguments",
 ) -> None:
-    """
-    Patch Qwen2VL forward to apply Temporal Token Pruning.
-
-    This can work standalone or combined with STP:
-    - Standalone: Only apply TTP temporal reduction
-    - With STP: First apply STP spatial reduction, then TTP temporal reduction
-
-    Args:
-        model: The pretrained VLM model
-        model_args: Model arguments containing TTP configuration
-    """
+    """Monkey-patch Qwen2VL/Qwen2.5VL inner forward to apply TTP (+ optional STP)."""
     if not getattr(model_args, "use_ttp", False):
         return
 
@@ -747,26 +647,15 @@ def patch_qwen3vl_forward_with_ttp(
     model_args: "ModelArguments",
 ) -> None:
     """
-    Patch Qwen3VL forward to apply Temporal Token Pruning.
+    Monkey-patch Qwen3VL model forward to apply TTP (and optionally STP).
 
-    This can work standalone or combined with STP:
-    - Standalone: Only apply TTP temporal reduction
-    - With STP: First apply STP spatial reduction, then TTP temporal reduction
+    Replaces both ``inner_model.forward`` (patched_forward — handles ViT
+    call, mask computation, token removal, and LLM forward) and
+    ``model.forward`` (patched_outer_forward — handles label shortening
+    and loss computation after token removal).
 
-    Args:
-        model: The pretrained VLM model
-        model_args: Model arguments containing TTP configuration
-
-    Debug Logging:
-        When `debug_token_removal: true` is set in the training config YAML,
-        detailed logs are written to /tmp/ttp_forward_debug_rank{rank}.log
-        for each GPU rank. This is useful for debugging distributed training hangs.
-
-        Example YAML config:
-            debug_token_removal: true
-
-        To view logs after training hangs:
-            cat /tmp/ttp_forward_debug_rank*.log
+    When ``debug_token_removal: true`` in config YAML, detailed logs are
+    written to ``/tmp/ttp_forward_debug.log``.
     """
     if not getattr(model_args, "use_ttp", False):
         return
@@ -812,21 +701,17 @@ def patch_qwen3vl_forward_with_ttp(
     # Store original forward
     original_forward = inner_model.forward
 
-    # Import / enable STP helpers if needed.
-    # When STP+TTP are both enabled, `patcher.py` intentionally avoids applying
-    # the STP forward patch (to prevent conflicting forward replacements).
-    # However, we still want STP's *vision pruning* to be available so we can
-    # pass keep masks into `get_video_features(..., stp_keep_mask=...)`.
+    # When STP+TTP are co-enabled, patcher.py skips the STP forward patch
+    # (to avoid conflicting forward replacements).  We still need the STP
+    # vision-pruning helper for keep-mask-based ViT speedup.
     if use_stp and stp_mode == "forward_removal":
         from .stp import compute_token_keep_mask_from_pixels
         from .stp import patch_stp_qwen3vl_vision_encoder_with_pruning
-
-        # Patch vision encoder to support pruning (vision-only, safe with TTP forward patch).
         stp_threshold = getattr(model_args, "stp_threshold", 0.0)
         if stp_threshold > 0:
             patch_stp_qwen3vl_vision_encoder_with_pruning(model, model_args)
 
-    # Get debug flag from model_args (closure variable)
+    # Debug flag captured as closure variable
     _debug_token_removal = getattr(model_args, "debug_token_removal", False)
 
     def patched_forward(
@@ -844,10 +729,11 @@ def patch_qwen3vl_forward_with_ttp(
     ):
         from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModelOutputWithPast
 
-        # Debug logging (only when debug_token_removal: true in config)
         import os
         import time as _time_mod
         _local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+        # Debug logging (only when debug_token_removal: true in config)
         if _debug_token_removal and _local_rank == 0:
             with open("/tmp/ttp_forward_debug.log", "a") as f:
                 f.write(f"[TTP Forward] Start, video_grid_thw={video_grid_thw}\n")
@@ -865,10 +751,19 @@ def patch_qwen3vl_forward_with_ttp(
         global_use_ttp = True  # TTP patch is applied, so default is True
         global_use_stp = use_stp and stp_mode == "forward_removal"
 
-        # Get per-video settings from collator (if provided)
-        # These are lists with one entry per video in the batch
-        per_video_use_stp = kwargs.pop("_per_video_use_stp", None)
-        per_video_use_ttp = kwargs.pop("_per_video_use_ttp", None)
+        # Per-video STP/TTP overrides (from collator or stashed on model
+        # by trainer.prediction_step before generate()).
+        _outer = getattr(inner_model, "_ttp_outer_model_ref", None)
+        per_video_use_stp = kwargs.pop(
+            "_per_video_use_stp",
+            getattr(inner_model, "_ttp_per_video_use_stp",
+                    getattr(_outer, "_ttp_per_video_use_stp", None)),
+        )
+        per_video_use_ttp = kwargs.pop(
+            "_per_video_use_ttp",
+            getattr(inner_model, "_ttp_per_video_use_ttp",
+                    getattr(_outer, "_ttp_per_video_use_ttp", None)),
+        )
 
         # Store settings on model for debugging
         inner_model._ttp_global_use_ttp = global_use_ttp
@@ -894,12 +789,11 @@ def patch_qwen3vl_forward_with_ttp(
             inner_model._ttp_video_keep_mask = None
             inner_model._ttp_video_keep_mask_raw = None
             inner_model._stp_video_keep_mask = None
+            inner_model._ttp_num_removed = 0
 
-            # Clear rope_deltas only at the start of a new sequence.
-            # Only clear when position_ids is None (step 4 will recompute it).
-            # When position_ids is provided externally (e.g., from prepare_inputs_for_generation),
-            # preserve the existing rope_deltas for the step-5 correction, avoiding a
-            # redundant second call to get_rope_index.
+            # Only clear rope_deltas when position_ids is None (Step 4 will
+            # recompute).  When position_ids is provided (e.g. from
+            # prepare_inputs_for_generation), keep existing rope_deltas.
             if position_ids is None:
                 if hasattr(inner_model, "rope_deltas") and inner_model.rope_deltas is not None:
                     inner_model.rope_deltas = None
@@ -908,14 +802,11 @@ def patch_qwen3vl_forward_with_ttp(
         video_keep_mask = None
         video_keep_mask_raw = None
 
-        # Pop precomputed mask from kwargs (set by data-loader worker in mm_plugin._get_mm_inputs).
-        # When present this avoids all on-the-fly mask computation in the forward pass.
+        # Precomputed TTP+STP mask from data-loader (avoids on-the-fly computation).
         _precomputed_video_mask = kwargs.pop("video_ttp_keep_mask", None)
 
-        # Step 2: Process videos with TTP (conditionally based on per-video settings)
-        # CRITICAL: For DeepSpeed ZeRO-3 compatibility, ALL GPUs must execute the SAME code path.
-        # We achieve this by ALWAYS computing a mask and ALWAYS calling get_video_features with it.
-        # When STP/TTP is disabled for a video, we create an all-True mask for that video.
+        # Step 2: Process videos — compute STP/TTP keep mask and call ViT.
+        # All GPUs always compute a mask (all-True when disabled) for ZeRO-3 compat.
         deepstack_video_embeds = None
         if pixel_values_videos is not None:
             num_videos = video_grid_thw.shape[0]
@@ -929,32 +820,25 @@ def patch_qwen3vl_forward_with_ttp(
                     f.write(f"[TTP Forward] per_video_use_ttp={per_video_use_ttp}\n")
                     f.write(f"[TTP Forward] precomputed_mask={'yes' if _precomputed_video_mask is not None else 'no'}\n")
 
-            # Check whether any per-video override requires individual mask rebuilding.
-            # None entries mean "use global setting", so they are compatible with the
-            # precomputed mask (which was built with global settings).
+            # Per-video overrides invalidate the precomputed mask.
             _has_per_video_override = (
                 (per_video_use_ttp is not None and any(v is not None for v in per_video_use_ttp))
                 or (per_video_use_stp is not None and any(v is not None for v in per_video_use_stp))
             )
 
             if _precomputed_video_mask is not None and not _has_per_video_override:
-                # Fast path: use mask precomputed in the CPU data-loader worker.
-                # The combined TTP+STP mask was already built with the correct video_grid_thw,
-                # so we only need to move it to the right device.
+                # Fast path: reuse precomputed mask (just move to device).
                 video_keep_mask = _precomputed_video_mask.to(pixel_values_videos.device)
                 if _debug_token_removal:
                     video_keep_mask_raw = video_keep_mask.clone().detach()
                     inner_model._ttp_video_keep_mask_raw = video_keep_mask_raw
                     inner_model._ttp_video_keep_mask = video_keep_mask.detach()
             else:
-                # Slow path: compute mask on the fly.
-                # Used when: no precomputed mask is available (e.g. legacy data without the key),
-                # or when per-video overrides require individual mask rebuilding.
-
-                # Compute per-video token counts for mask construction
+                # Slow path: compute mask on the fly (no precomputed or has overrides).
+                # Per-video token counts for mask construction
                 tokens_per_video = (torch.prod(video_grid_thw, dim=1) // merge_unit).tolist()
 
-                # Compute full TTP mask for all videos (we'll override disabled ones with all-True)
+                # Full TTP mask (disabled videos overridden with all-True below)
                 full_ttp_mask = compute_run_length_keep_mask(
                     pixel_values_videos,
                     video_grid_thw,
@@ -967,10 +851,10 @@ def patch_qwen3vl_forward_with_ttp(
                     use_raw_frames_in_ttp=use_raw_frames_in_ttp,
                     comparison_mode=comparison_mode,
                 )
-                # Only clone if debugging is enabled, otherwise reuse the mask
+                # Only clone for debug; otherwise reuse directly
                 video_keep_mask_raw = full_ttp_mask.clone().detach() if _debug_token_removal else full_ttp_mask
 
-                # Compute full STP mask if globally enabled
+                # Full STP mask (if globally enabled)
                 full_stp_mask = None
                 stp_threshold = getattr(model_args, "stp_threshold", 0.0)
                 if global_use_stp and stp_threshold > 0:
@@ -988,41 +872,33 @@ def patch_qwen3vl_forward_with_ttp(
                         temporal_aggregation=getattr(model_args, "stp_temporal_aggregation", "first"),
                         use_raw_frames_in_stp=getattr(model_args, "use_raw_frames_in_stp", False),
                     )
-                    # Only store if debugging is enabled
                     if _debug_token_removal:
                         inner_model._stp_video_keep_mask = full_stp_mask.detach()
 
-                # Build final mask by combining per-video settings
-                # For each video, decide whether to use actual mask or all-True mask
+                # Build per-video final mask: actual mask or all-True for disabled videos
                 video_keep_mask_parts = []
                 token_offset = 0
                 for vid_idx in range(num_videos):
                     num_tokens = int(tokens_per_video[vid_idx])
 
-                    # Determine effective settings for this video
-                    # None means use global setting, True/False overrides global
+                    # None = use global setting, True/False overrides
                     vid_use_ttp = per_video_use_ttp[vid_idx] if per_video_use_ttp else None
                     vid_use_stp = per_video_use_stp[vid_idx] if per_video_use_stp else None
 
                     effective_vid_use_ttp = vid_use_ttp if vid_use_ttp is not None else global_use_ttp
                     effective_vid_use_stp = vid_use_stp if vid_use_stp is not None else global_use_stp
 
-                    # Get the mask segment for this video
+                    # Mask segments for this video
                     ttp_segment = full_ttp_mask[token_offset:token_offset + num_tokens]
                     stp_segment = full_stp_mask[token_offset:token_offset + num_tokens] if full_stp_mask is not None else None
 
-                    # Build the final mask for this video
                     if effective_vid_use_ttp and effective_vid_use_stp and stp_segment is not None:
-                        # Both enabled: combine masks
                         vid_mask = combine_stp_and_ttp_masks(stp_segment, ttp_segment)
                     elif effective_vid_use_ttp:
-                        # Only TTP enabled
                         vid_mask = ttp_segment
                     elif effective_vid_use_stp and stp_segment is not None:
-                        # Only STP enabled
                         vid_mask = stp_segment
                     else:
-                        # Both disabled: all-True mask (no token removal)
                         vid_mask = torch.ones(num_tokens, dtype=torch.bool, device=pixel_values_videos.device)
 
                     video_keep_mask_parts.append(vid_mask)
@@ -1032,33 +908,19 @@ def patch_qwen3vl_forward_with_ttp(
                         with open("/tmp/ttp_forward_debug.log", "a") as f:
                             f.write(f"[TTP Forward] Video {vid_idx}: use_ttp={effective_vid_use_ttp}, use_stp={effective_vid_use_stp}, kept={vid_mask.sum()}/{num_tokens}\n")
 
-                # Concatenate all video masks
                 video_keep_mask = torch.cat(video_keep_mask_parts, dim=0)
 
-                # Expose masks for scripts (detach to prevent gradient accumulation)
-                # Only store if debugging is enabled, otherwise skip to save memory
+                # Store masks for debug scripts only
                 if _debug_token_removal:
                     inner_model._ttp_video_keep_mask_raw = video_keep_mask_raw.detach() if video_keep_mask_raw is not None else None
                     inner_model._ttp_video_keep_mask = video_keep_mask.detach() if video_keep_mask is not None else None
 
-                # Clean up intermediate list to release memory
                 del video_keep_mask_parts
 
-            # Get video features — always route through _stp_qwen3vl_visual_forward_pruned.
-            #
-            # CRITICAL for DeepSpeed ZeRO-3: every GPU must call the same ViT blocks in
-            # the same order.  A conditional branch like
-            #   if has_removals: pruned_path() else: original_get_video_features()
-            # would cause GPUs whose masks happen to be all-True to take a different code
-            # path and miss the AllGather barriers that ZeRO-3 issues for each ViT block,
-            # leading to a deadlock.
-            #
-            # Solution: unconditionally call _stp_qwen3vl_visual_forward_pruned.
-            # When the mask is all-True (nothing removed) this has minor extra overhead
-            # (one extra nonzero() call and a scatter-copy) but guarantees an identical
-            # call graph on every GPU.  When tokens are removed the pruned path provides
-            # the intended O(n_kept²) vs O(n_full²) ViT speedup.
-            # --- Diagnostic: mask stats + ViT timing (always print on rank 0) ---
+            # Always route through pruned ViT path — required for DeepSpeed ZeRO-3
+            # which needs identical collective call graphs on every GPU.  When the
+            # mask is all-True the overhead is negligible (one nonzero + scatter).
+            # --- Diagnostic: mask stats + ViT timing (rank 0) ---
             if _local_rank == 0:
                 _mask_total = video_keep_mask.numel()
                 _mask_kept = int(video_keep_mask.sum())
@@ -1079,8 +941,7 @@ def patch_qwen3vl_forward_with_ttp(
                 video_keep_mask,
                 _debug_token_removal,
             )
-            # Split the full-length output back into per-video tensors (same shape contract
-            # as the original inner_model.get_video_features return value).
+            # Split output into per-video tensors (same contract as get_video_features).
             _split_sizes = (video_grid_thw.prod(-1) // merge_unit).tolist()
             video_result = (torch.split(_vit_out, _split_sizes), _deepstack_out)
 
@@ -1095,8 +956,7 @@ def patch_qwen3vl_forward_with_ttp(
                 else:
                     video_embeds_cat = video_embeds_tuple
             elif hasattr(video_result, "pooler_output"):
-                # BaseModelOutputWithDeepstackFeatures (new transformers dataclass return type)
-                # pooler_output is a tuple of per-video tensors (already merged/split by grid)
+                # BaseModelOutputWithDeepstackFeatures (newer transformers)
                 deepstack_video_embeds = getattr(video_result, "deepstack_features", None)
                 video_embeds_tuple = video_result.pooler_output
                 if isinstance(video_embeds_tuple, (tuple, list)):
@@ -1114,7 +974,7 @@ def patch_qwen3vl_forward_with_ttp(
             video_token_mask = video_mask[..., 0] if video_mask.dim() > 2 else video_mask.squeeze(-1)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds_cat)
 
-        # Step 3: Process images (no TTP for single-frame images)
+        # Step 3: Process images (no TTP applied to single-frame images)
         image_token_mask = None
         deepstack_image_embeds = None
         if pixel_values is not None:
@@ -1126,8 +986,7 @@ def patch_qwen3vl_forward_with_ttp(
                 else:
                     image_embeds_cat = image_embeds_tuple
             elif hasattr(image_result, "pooler_output"):
-                # BaseModelOutputWithDeepstackFeatures (new transformers dataclass return type)
-                # pooler_output is a tuple of per-image tensors (already merged/split by grid)
+                # BaseModelOutputWithDeepstackFeatures (newer transformers)
                 deepstack_image_embeds = getattr(image_result, "deepstack_features", None)
                 image_embeds_tuple = image_result.pooler_output
                 if isinstance(image_embeds_tuple, (tuple, list)):
@@ -1175,10 +1034,9 @@ def patch_qwen3vl_forward_with_ttp(
                 delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
                 position_ids = position_ids + delta.to(position_ids.device)
 
-        # Step 5: Remove video tokens based on TTP mask
-        # GenerationMixin may have converted 2D attention_mask to 4D causal mask.
-        # Step 5's filtering assumes 2D. If 4D, fall back to None so the LLM
-        # creates its own causal mask from the 2D mask stored on the model.
+        # Step 5: Remove pruned video tokens from the sequence.
+        # GenerationMixin may have expanded attention_mask to 4D; reset to
+        # None so the LLM rebuilds a causal mask from the (now shorter) 2D mask.
         if attention_mask is not None and attention_mask.ndim != 2:
             if _local_rank == 0:
                 print(f"[TTP] WARNING: attention_mask is {attention_mask.ndim}D (expected 2D), setting to None")
@@ -1250,12 +1108,8 @@ def patch_qwen3vl_forward_with_ttp(
                 pad_len = max_len - cur_len
 
                 if pad_len > 0:
-                    # LEFT-pad (not right-pad) so that valid tokens are contiguous
-                    # at the END of the sequence.  During decode, generated tokens
-                    # are appended after the valid region, giving a mask like
-                    #   [0,...,0, 1,...,1, 1,1,...]   ← contiguous 1s
-                    # Right-padding would give [1,...,1, 0,...,0, 1,...] which is
-                    # non-contiguous and breaks Flash Attention with batch_size>1.
+                    # LEFT-pad so valid tokens are contiguous at the end,
+                    # which is required by Flash Attention with batch_size>1.
                     emb = torch.nn.functional.pad(emb, (0, 0, pad_len, 0))
                     pos = torch.nn.functional.pad(pos, (pad_len, 0))
                     if attention_mask is not None:
@@ -1274,21 +1128,14 @@ def patch_qwen3vl_forward_with_ttp(
             if attention_mask is not None:
                 attention_mask = torch.stack(padded_masks, dim=0)
 
-            # Clean up intermediate lists to release memory
             del new_inputs_embeds_list, new_position_ids_list, new_attention_mask_list
             del padded_embeds, padded_positions, padded_masks
 
             if cache_position is not None:
                 cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
 
-            # NOTE: Do NOT correct rope_deltas here.
-            # model_kwargs["cache_position"] stays at the original length L (not
-            # max_len), because _update_model_kwargs_for_generation operates on the
-            # un-shortened model_kwargs.  During decode, the position is computed as
-            #   delta = cache_position[0] + rope_deltas
-            #         = (L + k) + (mrope_max + 1 - L)
-            #         = mrope_max + 1 + k              ← correct
-            # Adding num_removed to rope_deltas would double-count the removal.
+            # Do NOT correct rope_deltas: cache_position keeps original length L
+            # (see detailed explanation in the second rope_deltas note below).
 
             if _local_rank == 0:
                 _n_removed = seq_len - inputs_embeds.shape[1]
@@ -1316,44 +1163,41 @@ def patch_qwen3vl_forward_with_ttp(
                     padded_visual_masks.append(vm)
                 visual_pos_masks = torch.stack(padded_visual_masks, dim=0)
 
-                # Clean up intermediate lists
                 del new_visual_pos_masks_list, padded_visual_masks
 
-            # Update deepstack_visual_embeds to match the filtered tokens
-            # deepstack_visual_embeds can be:
-            # - A tensor with shape (num_visual_tokens, hidden_dim)
-            # - A list of tensors, each with shape (num_visual_tokens, hidden_dim)
-            # We need to filter it based on video_keep_mask
+            # Filter deepstack_visual_embeds to match kept tokens
             if deepstack_visual_embeds is not None and video_keep_mask is not None:
-                # video_keep_mask is a 1D boolean tensor for all video tokens
                 if isinstance(deepstack_visual_embeds, (list, tuple)):
-                    # Filter each tensor in the list, ensuring mask is on same device
                     deepstack_visual_embeds = [
                         emb[video_keep_mask.to(emb.device)] for emb in deepstack_visual_embeds
                     ]
                 else:
-                    # Single tensor
                     deepstack_visual_embeds = deepstack_visual_embeds[
                         video_keep_mask.to(deepstack_visual_embeds.device)
                     ]
 
-            # Store for label update (detach to prevent gradient accumulation)
+            # Store for label shortening in patched_outer_forward
             inner_model._ttp_seq_keep_mask = seq_keep_mask.detach()
             inner_model._ttp_max_len = max_len
 
-            # Store the shortened attention_mask so that prepare_inputs_for_generation
-            # can fix model_kwargs during decode.  Without this, the generate loop's
-            # attention_mask stays at the original (pre-removal) length, causing the
-            # model to attend to non-existent KV-cache positions and producing garbage
-            # that prevents EOS generation.
             inner_model._ttp_step5_attn_mask = attention_mask.detach()
+            inner_model._ttp_num_removed = seq_len - inputs_embeds.shape[1]
 
-        # Ensure position_ids is 3D [temporal, height, width] to match training.
-        # prepare_inputs_for_generation builds 4D [text, temporal, height, width],
-        # but apply_interleaved_mrope only uses the first 3 dims of freqs.
-        # With 4D, the mapping shifts: text replaces temporal, temporal replaces
-        # height, height replaces width, and width is DROPPED entirely.
-        # Fix: drop dim 0 (text) to recover [temporal, height, width].
+            # IMPORTANT: Do NOT correct rope_deltas after token removal.
+            #
+            # model_kwargs["cache_position"] retains the ORIGINAL sequence
+            # length L (not the pruned length), because
+            # _update_model_kwargs_for_generation operates on the un-shortened
+            # model_kwargs.  During decode step k, position is:
+            #
+            #   pos = cache_position[0] + rope_deltas
+            #       = (L + k) + (mrope_max + 1 - L)
+            #       = mrope_max + 1 + k              ← already correct
+            #
+            # Adding num_removed would double-count the removal.
+
+        # Fix 4D→3D position_ids: prepare_inputs_for_generation may build
+        # [text, t, h, w] but M-RoPE expects [t, h, w]. Drop dim 0.
         if position_ids is not None and position_ids.shape[0] == 4:
             position_ids = position_ids[1:]  # [4, B, L] → [3, B, L]
 
@@ -1396,8 +1240,12 @@ def patch_qwen3vl_forward_with_ttp(
         return output if return_dict else output.to_tuple()
 
     inner_model.forward = patched_forward
+    # Use __dict__ to avoid nn.Module.__setattr__ registering `model` as a
+    # child of inner_model (would create model↔inner_model circular ref
+    # causing RecursionError in model.train()/eval()).
+    inner_model.__dict__["_ttp_outer_model_ref"] = model
 
-    # Patch outer model forward for label update
+    # Patch outer model forward for label shortening after TTP token removal.
     original_outer_forward = model.forward
 
     def patched_outer_forward(
@@ -1416,7 +1264,7 @@ def patch_qwen3vl_forward_with_ttp(
     ):
         from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast
 
-        # Clear previous keep mask with explicit deletion to release memory
+        # Clear previous masks (explicit deletion to release GPU memory)
         for attr_name in ["_ttp_seq_keep_mask", "_ttp_max_len", "_ttp_video_keep_mask",
                           "_ttp_video_keep_mask_raw", "_stp_video_keep_mask"]:
             if hasattr(inner_model, attr_name):
@@ -1426,7 +1274,7 @@ def patch_qwen3vl_forward_with_ttp(
         inner_model._ttp_seq_keep_mask = None
         inner_model._ttp_max_len = None
 
-        # Also clear model-level attributes
+        # Clear model-level stale labels
         if hasattr(model, "_ttp_updated_labels"):
             old_labels = getattr(model, "_ttp_updated_labels", None)
             if old_labels is not None:
@@ -1448,7 +1296,7 @@ def patch_qwen3vl_forward_with_ttp(
 
         hidden_states = outputs[0]
 
-        # Update labels if tokens were removed
+        # Shorten labels to match reduced sequence length after TTP removal
         if labels is not None and getattr(inner_model, "_ttp_seq_keep_mask", None) is not None:
             seq_keep_mask = inner_model._ttp_seq_keep_mask
             max_len = inner_model._ttp_max_len
@@ -1478,14 +1326,12 @@ def patch_qwen3vl_forward_with_ttp(
                 padded_labels.append(lab)
             labels = torch.stack(padded_labels, dim=0)
 
-            # Clean up intermediate lists to release memory
-            del new_labels_list
-            del padded_labels
+            del new_labels_list, padded_labels
 
-            # Store updated labels for trainer to access (detach to prevent gradient accumulation)
+            # Store shortened labels for trainer access (detached)
             model._ttp_updated_labels = labels.detach().clone()
 
-            # Clear seq_keep_mask reference on inner_model
+            # Clear stale mask references
             inner_model._ttp_seq_keep_mask = None
             inner_model._ttp_max_len = None
 
@@ -1521,16 +1367,7 @@ def apply_ttp_forward_patch(
     model: "PreTrainedModel",
     model_args: "ModelArguments",
 ) -> None:
-    """
-    Apply TTP forward patch based on model type.
-
-    This is the main entry point for applying Temporal Token Pruning.
-    It detects the model type and applies the appropriate patch.
-
-    Args:
-        model: The pretrained VLM model
-        model_args: Model arguments containing TTP configuration
-    """
+    """Main entry point: detect model type and apply the appropriate TTP patch."""
     if not getattr(model_args, "use_ttp", False):
         return
 

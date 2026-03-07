@@ -47,7 +47,7 @@ logger = logging.get_logger(__name__)
 
 
 class CustomSeq2SeqTrainer(Seq2SeqTrainer):
-    r"""Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE."""
+    r"""Extended Seq2SeqTrainer with video reward metrics, STP/TTP support, and vLLM eval."""
 
     def __init__(
         self,
@@ -60,7 +60,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         **kwargs,
     ) -> None:
         kwargs["processing_class"] = kwargs.pop("tokenizer")
-        # Configure FP8 environment if enabled
+        # FP8 setup
         training_args: TrainingArguments = kwargs.get("args")
         if training_args.fp8:
             configure_fp8_environment(training_args)
@@ -69,9 +69,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         super().__init__(**kwargs)
         if processor is not None:
-            # avoid wrong loss under gradient accumulation
-            # https://github.com/huggingface/transformers/pull/36044#issuecomment-2746657112
-            self.model_accepts_loss_kwargs = False
+            self.model_accepts_loss_kwargs = False  # HF PR#36044 fix
 
         self.finetuning_args = finetuning_args
         self.model_args = model_args
@@ -79,7 +77,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self.generating_args = generating_args
         self.processor = processor
         if gen_kwargs is not None:
-            # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
             self._gen_kwargs = gen_kwargs
 
         if processor is not None:
@@ -107,13 +104,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             verify_fp8_status(self.accelerator, training_args)
 
 
-        # Persistent vLLM engine for sleep/wake mode
+        # vLLM sleep/wake engine state
         self._vllm_engine = None
         self._vllm_engine_sleeping = False
-        self._expandable_segments_was_enabled = False  # track runtime state across sleep/wake
+        self._expandable_segments_was_enabled = False
 
+        # Video reward training metric (O(1) memory via running counts)
         self._train_video_reward_metric: Optional[ComputeVideoRewardAccuracy] = None
-        # Keep O(1) memory: accumulate correct/total counts instead of storing a growing buffer.
         self._train_video_reward_correct_count: int = 0
         self._train_video_reward_total_count: int = 0
         self._train_prediction_samples: list[dict[str, Any]] = []
@@ -191,16 +188,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @override
     def get_train_dataloader(self):
-        """Override to handle paired_interleave sampler correctly.
-
-        For paired_interleave mode, we bypass accelerator.prepare() because our
-        DistributedPairedShuffleSampler already handles distribution across GPUs.
-        Using accelerator.prepare() would add BatchSamplerShard on top, causing
-        double-sharding and reducing the step count to 1/N where N = num_GPUs.
-
-        We cache the DataLoader to avoid creating new workers on each call,
-        which can cause "Too many open files" errors with high num_workers.
-        """
+        """Bypass accelerator.prepare() for paired_interleave (avoids double-sharding)."""
         # Check if we need special handling for paired_interleave
         use_paired_interleave = (
             self.data_args is not None
@@ -213,12 +201,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # Use default behavior for non-paired_interleave cases
             return super().get_train_dataloader()
 
-        # Return cached dataloader if available (avoids creating new workers)
+        # Return cached dataloader (avoids recreating workers)
         if hasattr(self, "_paired_interleave_train_dataloader") and self._paired_interleave_train_dataloader is not None:
             return self._paired_interleave_train_dataloader
 
-        # For paired_interleave with distributed training, create DataLoader manually
-        # to bypass accelerator.prepare() which would add unwanted BatchSamplerShard
+        # Manual DataLoader creation (skip accelerator.prepare → no BatchSamplerShard)
         from functools import partial
         from torch.utils.data import DataLoader
 
@@ -230,7 +217,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         train_dataset = self.train_dataset
         data_collator = self.data_collator
 
-        # Remove unused columns if using datasets library
+        # Remove unused columns if HF Datasets
         try:
             from datasets import Dataset as HFDataset
             if isinstance(train_dataset, HFDataset):
@@ -238,7 +225,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         except ImportError:
             pass
 
-        # Create our custom distributed sampler and cache it for epoch updates
+        # Custom distributed sampler (cached for epoch updates)
         group_size = self.data_args.paired_interleave_group_size
         sampler = DistributedPairedShuffleSampler(
             train_dataset,
@@ -258,13 +245,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             f"sampler_len={len(sampler)}, expected_steps={len(sampler) // (self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps)}"
         )
 
-        # Create DataLoader with our custom sampler (no accelerator.prepare())
+        # Create DataLoader with custom sampler
         from transformers.trainer_utils import seed_worker
 
-        # Handle persistent_workers: only enable if num_workers > 0
+        # persistent_workers / prefetch_factor require num_workers > 0
         num_workers = self.args.dataloader_num_workers
         persistent_workers = self.args.dataloader_persistent_workers if num_workers > 0 else False
-        # prefetch_factor is only valid when num_workers > 0
         prefetch_factor = self.args.dataloader_prefetch_factor if num_workers > 0 else None
 
         dataloader_params = {
@@ -279,20 +265,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 seed_worker, num_workers=num_workers, rank=self.args.process_index
             ) if num_workers > 0 else None,
         }
-        # Only add prefetch_factor if num_workers > 0
         if prefetch_factor is not None:
             dataloader_params["prefetch_factor"] = prefetch_factor
 
         dataloader = DataLoader(train_dataset, **dataloader_params)
 
-        # Add set_epoch method to the dataloader so Trainer can update sampler epoch
-        # This is needed because we bypass accelerator.prepare() which normally adds this
+        # Trainer needs set_epoch (normally added by accelerator.prepare)
         def set_epoch(epoch: int):
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
         dataloader.set_epoch = set_epoch
 
-        # Cache the dataloader to avoid recreating workers
+        # Cache to avoid recreating workers
         self._paired_interleave_train_dataloader = dataloader
 
         logger.info_rank0(
@@ -307,38 +291,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return_outputs = kwargs.pop("return_outputs", False)
         loss, outputs = super().compute_loss(model, inputs, *args, return_outputs=True, **kwargs)
 
-        # # Debug: Print TTP/STP detection status every 50 steps (only on rank 0)
-        # if self.state.global_step % 1 == 0:
-        #     try:
-        #         import os
-        #         if int(os.environ.get("LOCAL_RANK", 0)) == 0:
-        #             unwrapped = self.accelerator.unwrap_model(model) if hasattr(self, "accelerator") else model
-        #             inner = getattr(unwrapped, "model", unwrapped)
-        #             detected_low_res = getattr(inner, "_ttp_detected_low_res", None)
-        #             tokens_per_frame = getattr(inner, "_ttp_tokens_per_frame", None)
-        #             eff_ttp = getattr(inner, "_ttp_effective_use_ttp", None)
-        #             eff_stp = getattr(inner, "_ttp_effective_use_stp", None)
-        #             import sys
-        #             sys.stderr.write(
-        #                 f"[Step {self.state.global_step}] TTP/STP: "
-        #                 f"low_res={detected_low_res}, tokens/frame={tokens_per_frame}, "
-        #                 f"use_ttp={eff_ttp}, use_stp={eff_stp}\n"
-        #             )
-        #             sys.stderr.flush()
-        #     except Exception:
-        #         pass  # Silently ignore any errors
-
         if self._train_video_reward_metric is not None and "labels" in inputs and outputs is not None:
             logits = outputs.get("logits") if isinstance(outputs, dict) else getattr(outputs, "logits", None)
             if logits is not None:
-                # Check if TTP updated the labels (labels may have been shortened due to token removal)
-                # Get the underlying model (unwrap DeepSpeed/FSDP wrappers if needed)
+                # Use TTP-shortened labels if available (matches pruned logits shape).
                 unwrapped_model = self.accelerator.unwrap_model(model) if hasattr(self, "accelerator") else model
                 ttp_updated_labels = getattr(unwrapped_model, "_ttp_updated_labels", None)
                 if ttp_updated_labels is not None:
-                    # Use the updated labels that match the logits shape
                     inputs_for_metric = {**inputs, "labels": ttp_updated_labels}
-                    # Clear the stored labels to avoid stale data
                     unwrapped_model._ttp_updated_labels = None
                 else:
                     inputs_for_metric = inputs
@@ -356,30 +316,24 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         ignore_keys: Optional[list[str]] = None,
         **gen_kwargs,
     ) -> tuple[Optional[float], Optional["torch.Tensor"], Optional["torch.Tensor"]]:
-        r"""Remove the prompt part in the generated tokens.
-
-        Subclass and override to inject custom behavior.
-        """
-        # Use self._gen_kwargs if gen_kwargs is empty (same logic as Seq2SeqTrainer.prediction_step)
-        # This must be done BEFORE adding synced_gpus, otherwise the len(gen_kwargs) == 0 check
-        # in the parent class will fail and self._gen_kwargs won't be used.
+        r"""Override to handle STP/TTP flags and DeepSpeed synced_gpus for generation."""
+        # Restore _gen_kwargs BEFORE adding synced_gpus (parent checks len == 0).
         if len(gen_kwargs) == 0 and hasattr(self, "_gen_kwargs"):
             gen_kwargs = self._gen_kwargs.copy()
 
-        if self.args.predict_with_generate:  # do not pass labels to model when generate
+        if self.args.predict_with_generate:
             labels = inputs.pop("labels", None)
-            # Remove video_metadata as it's not a valid argument for model.generate()
             inputs.pop("video_metadata", None)
-            # NOTE: Keep _per_video_use_stp and _per_video_use_ttp in inputs.
-            # They flow through generate() → prepare_inputs_for_generation() → model.forward()
-            # → patched_forward() where they're consumed via kwargs.pop().
-            # Without them, TTP/STP defaults to globally enabled, ignoring per-dataset
-            # use_stp/use_ttp=false settings in dataset_info.json.
-            # Set synced_gpus=True for DDP distributed training to avoid deadlock.
-            # In DDP mode, different GPUs may generate sequences of different lengths,
-            # which can cause deadlock during gather operations if synced_gpus is not set.
-            # transformers only sets this automatically for DeepSpeed Zero3 and FSDP.
-            if self.args.world_size > 1 and "synced_gpus" not in gen_kwargs:
+            # Stash STP/TTP flags on model (generate() rejects unknown kwargs).
+            _stp = inputs.pop("_per_video_use_stp", None)
+            _ttp = inputs.pop("_per_video_use_ttp", None)
+            _uw = self.accelerator.unwrap_model(self.model)
+            _uw._ttp_per_video_use_stp = _stp
+            _uw._ttp_per_video_use_ttp = _ttp
+
+            # TTP/STP makes sequence lengths differ across GPUs, so force
+            # synced_gpus to prevent NCCL deadlock in the eval gather.
+            if self.is_deepspeed_enabled:
                 gen_kwargs["synced_gpus"] = True
         else:
             labels = inputs.get("labels")
@@ -387,18 +341,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         loss, generated_tokens, _ = super().prediction_step(
             model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys, **gen_kwargs
         )
+
         if generated_tokens is not None and self.args.predict_with_generate:
             generated_tokens[:, : inputs["input_ids"].size(-1)] = self.processing_class.pad_token_id
             generated_tokens = generated_tokens.contiguous()
-
-            # Log decoded output on rank 0
-            import os
-            if int(os.environ.get("LOCAL_RANK", "0")) == 0:
-                for i in range(generated_tokens.size(0)):
-                    tokens = generated_tokens[i]
-                    tokens = tokens[tokens != self.processing_class.pad_token_id]
-                    text = self.processing_class.decode(tokens, skip_special_tokens=False)
-                    print(f"[TTP decode] sample {i} ({len(tokens)} tokens): {text[:300]}")
 
         return loss, generated_tokens, labels
 
@@ -412,7 +358,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     ) -> dict[str, float]:
         if self.finetuning_args.use_vllm_eval and self.args.predict_with_generate:
             return self._vllm_evaluate(eval_dataset, metric_key_prefix)
-        return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **kwargs)
+        # Forward _gen_kwargs to prevent Seq2SeqTrainer from overwriting
+        # max_new_tokens with max_length (128000).
+        _orig_gen_kwargs = self._gen_kwargs.copy() if hasattr(self, "_gen_kwargs") else {}
+        return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **_orig_gen_kwargs, **kwargs)
 
     def _vllm_evaluate(
         self,
@@ -426,14 +375,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @staticmethod
     def _fix_saved_config_for_vllm(saved_dir: str) -> None:
-        """Fix config.json saved by ``save_pretrained`` for vLLM compatibility.
-
-        transformers 4.57.2 has a bug in its mistral-regex check inside
-        ``_from_pretrained``: it accesses ``_config.model_type`` on a plain
-        dict loaded via ``json.load()``.  Setting ``transformers_version`` to
-        a value > 4.57.2 makes the check short-circuit and skip the buggy
-        code path entirely.
-        """
+        """Set transformers_version=99.0.0 to work around a transformers 4.57.2 bug."""
         config_path = os.path.join(saved_dir, "config.json")
         if not os.path.isfile(config_path):
             return
@@ -444,15 +386,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             json.dump(config, f, ensure_ascii=False, indent=2)
 
     def _create_vllm_engine(self, model_path: str):
-        """Create a vLLM engine with sleep mode support.
-
-        The caller (``_vllm_evaluate_sleep_wake``) is responsible for tearing
-        down and restoring ``torch.distributed`` — see the comments there.
-        This method only handles vLLM-specific env-var isolation.
-        """
+        """Create a vLLM engine with sleep mode, isolating env vars from training."""
         from vllm import LLM
 
-        # --- Isolate env vars so vLLM does not pick up training settings ---
+        # Isolate dist env vars from training
         _DIST_ENV_VARS = [
             "MASTER_ADDR", "MASTER_PORT",
             "RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE",
@@ -464,11 +401,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             if var in os.environ:
                 saved_env[var] = os.environ.pop(var)
 
-        # Run EngineCore in-process (avoid subprocess that inherits env vars).
+        # Run EngineCore in-process (avoid subprocess inheriting training env).
         saved_mp = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING")
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
-        # Bust the vllm.envs cache so the new value is picked up.
+        # Bust vllm.envs cache
         try:
             import vllm.envs as _vllm_envs
             if hasattr(_vllm_envs, "disable_envs_cache"):
@@ -476,14 +413,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         except Exception:
             pass
 
-        # vLLM's CuMemAllocator (required for sleep mode) is incompatible
-        # with PyTorch's expandable_segments.  Disable it at both the env-var
-        # level (checked by vLLM's assertion) and at the runtime level
-        # (checked by torch.cuda.MemPool).
-        #
-        # Following verl's pattern, expandable_segments stays DISABLED for the
-        # entire lifetime of the vLLM engine.  The caller
-        # (_vllm_evaluate_sleep_wake) re-enables it after engine sleep.
+        # Disable expandable_segments (incompatible with vLLM's CuMemAllocator).
         saved_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
         if "expandable_segments:True" in saved_alloc_conf:
             new_conf = saved_alloc_conf.replace("expandable_segments:True", "expandable_segments:False")
@@ -492,8 +422,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             prefix = saved_alloc_conf + "," if saved_alloc_conf else ""
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = prefix + "expandable_segments:False"
 
-        # Also disable at the PyTorch runtime allocator level.
-        # Track the original state so the caller can restore it later.
+        # Also disable at runtime level; track state for later restore.
         try:
             snap = torch.cuda.memory._snapshot()
             if snap.get("allocator_settings", {}).get("expandable_segments", False):
@@ -503,10 +432,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         except Exception:
             pass
 
-        # Each rank should use its own GPU.  vLLM's UniProcExecutor derives
-        # local_rank from ``DeviceConfig.device``.  By default this is just
-        # ``torch.device("cuda")`` (no index → local_rank 0).  We temporarily
-        # patch ``DeviceConfig.__post_init__`` so it preserves the GPU index.
+        # Patch DeviceConfig so vLLM uses the correct GPU per rank.
         local_rank = torch.cuda.current_device()
 
         from vllm.config.device import DeviceConfig as _DC
@@ -520,19 +446,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         try:
             max_model_len = self.finetuning_args.vllm_eval_max_model_len
-            # Load tokenizer from the original model directory (not the temp
-            # weight dir) to avoid huggingface_hub validation errors on local
-            # paths like /dev/shm.  The tokenizer never changes during training.
             tokenizer_path = self.model_args.model_name_or_path if self.model_args else model_path
-            # Dynamically cap gpu_memory_utilization based on actual free
-            # memory.  DeepSpeed / FSDP may leave optimizer states or
-            # buffers on GPU that we couldn't fully offload.
+            # Dynamically cap gpu_memory_utilization based on actual free memory.
             configured_gpu_util = self.finetuning_args.vllm_eval_gpu_util
             free_mem, total_mem = torch.cuda.mem_get_info()
-            # Reserve headroom for vision-encoder workspace (embedding
-            # 88K patches needs ~2-3 GiB), attention workspace, and
-            # fragmentation.  8 GiB is safe for Qwen3-VL-8B at 720p.
-            headroom_bytes = 8 * (2**30)  # 8 GiB
+            headroom_bytes = 8 * (2**30)  # 8 GiB for ViT workspace + fragmentation
             max_vllm_bytes = max(0, free_mem - headroom_bytes)
             max_safe_util = max_vllm_bytes / total_mem
             effective_gpu_util = min(configured_gpu_util, max(0.20, max_safe_util))
@@ -565,15 +483,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             engine = LLM(**engine_kwargs)
         finally:
             _DC.__post_init__ = _orig_post_init
-            # Restore env vars for training distributed group.
+            # Restore training env vars.
             os.environ.update(saved_env)
             if saved_mp is not None:
                 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = saved_mp
             else:
                 os.environ.pop("VLLM_ENABLE_V1_MULTIPROCESSING", None)
-            # Restore the CUDA allocator env-var so it doesn't leak into
-            # subprocesses.  The *runtime* setting stays disabled — the
-            # caller re-enables expandable_segments after engine sleep.
+            # Restore CUDA allocator env-var (runtime stays disabled until engine sleep).
             if saved_alloc_conf:
                 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = saved_alloc_conf
             else:
@@ -582,17 +498,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return engine
 
     def _load_raw_eval_data(self) -> list[dict[str, Any]]:
-        """Load raw eval data directly from JSON/JSONL files.
-
-        Bypasses LLaMA-Factory's data pipeline entirely.  Returns a list
-        of dicts ready for ``llm.chat()``, each containing:
-
-        - ``messages``: OpenAI-style chat messages with video_url content parts
-        - ``label``:    ground-truth text (e.g. ``\\box{correct}``)
-        - ``video_path``: original video file path
-        - ``user_instruction``: extracted user task text
-        - ``split``:    dataset split name (osworld / scalecua / …)
-        """
+        """Load raw eval data from JSON/JSONL files for vLLM chat (cached)."""
         if hasattr(self, "_vllm_raw_eval_data"):
             return self._vllm_raw_eval_data
 
@@ -677,12 +583,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     def _convert_weight_keys(
         state_dict: dict[str, "torch.Tensor"], model: "torch.nn.Module"
     ) -> dict[str, "torch.Tensor"]:
-        """Convert HF internal parameter names to checkpoint-format names.
-
-        Newer HuggingFace models may rename parameters internally via
-        ``_checkpoint_conversion_mapping``.  vLLM's ``load_weights`` expects
-        checkpoint-format names, so we reverse the mapping (same as verl).
-        """
+        """Reverse HF's ``_checkpoint_conversion_mapping`` for vLLM compatibility."""
         if not hasattr(model, "_checkpoint_conversion_mapping"):
             return state_dict
 
@@ -699,14 +600,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return converted
 
     def _sync_weights_to_vllm(self, unwrapped_model) -> None:
-        """Transfer weight tensors directly to vLLM engine (verl-style).
-
-        Instead of serializing to safetensors on disk/shm and reloading,
-        we pass the state_dict tensors directly to vLLM's ``reload_weights``
-        via ``collective_rpc``.  vLLM's ``model.load_weights()`` handles the
-        HF-checkpoint-name → vLLM-internal-name mapping and tensor-parallel
-        sharding in-place.
-        """
+        """Transfer state_dict directly to vLLM via collective_rpc (no disk I/O)."""
         state_dict = unwrapped_model.state_dict()
         state_dict = self._convert_weight_keys(state_dict, unwrapped_model)
         weights_list = list(state_dict.items())
@@ -719,15 +613,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._vllm_engine.reset_prefix_cache()
 
     def _offload_deepspeed_states_to_cpu(self, rank: int = 0) -> None:
-        """Move DeepSpeed ZeRO-2 internal GPU buffers to CPU.
-
-        DeepSpeed ZeRO Stage 2 stores data in internal flat buffers that are
-        invisible to ``model.to("cpu")``.  We must move them explicitly:
-
-        1. ``fp16_groups_flat`` – full FP16 model copy per GPU
-        2. ``single_partition_of_fp32_groups`` – partitioned FP32 master weights
-        3. ``optimizer.state`` – partitioned FP32 momentum + variance
-        """
+        """Move DeepSpeed ZeRO-2 internal flat buffers to CPU (invisible to model.to)."""
         if not hasattr(self.model, "optimizer") or self.model.optimizer is None:
             return
 
@@ -790,16 +676,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             logger.warning("vLLM eval: DeepSpeed offload partial (freed %.1f GiB): %s", offloaded / 2**30, e)
 
     def _restore_deepspeed_states_to_gpu(self, device: "torch.device", rank: int = 0) -> None:
-        """Move DeepSpeed ZeRO-2 internal buffers back to GPU after vLLM eval.
-
-        IMPORTANT: after moving ``bit16_groups_flat`` back to GPU we must
-        rebuild the parameter views via ``_update_model_bit16_weights``.
-        The offload step (``buf.data = buf.data.cpu()``) broke the view
-        relationship between model parameters and the flat buffer.  Without
-        rebuilding, the subsequent ``unwrapped.to(device)`` would allocate
-        **separate** GPU tensors for every parameter, doubling model memory
-        (~16 GiB for an 8B model) and causing OOM.
-        """
+        """Restore DeepSpeed ZeRO-2 buffers to GPU and rebuild parameter views."""
         if not hasattr(self.model, "optimizer") or self.model.optimizer is None:
             return
 
@@ -819,10 +696,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         buf.data = buf.data.to(device)
                         restored += buf.numel() * buf.element_size()
 
-            # Rebuild parameter-to-flat-buffer views.  DeepSpeed's
-            # _update_model_bit16_weights() calls unflatten() which
-            # creates views (not copies) of the flat buffer and
-            # reassigns them to each model parameter's .data.
+            # Rebuild param→flat-buffer views broken by .data replacement.
             if hasattr(zero_opt, "_update_model_bit16_weights"):
                 n_groups = len(
                     getattr(zero_opt, "bit16_groups",
@@ -873,12 +747,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @staticmethod
     def _aggressive_empty_cache(max_retries: int = 3) -> None:
-        """Aggressively free GPU memory (verl-style).
-
-        Runs ``gc.collect()`` → ``torch.cuda.synchronize()`` →
-        ``torch.cuda.empty_cache()`` in a retry loop, stopping early when
-        less than 1 GiB is freed per iteration.
-        """
+        """gc.collect + empty_cache in a retry loop until <1 GiB freed per iteration."""
         import gc
 
         for _ in range(max_retries):
@@ -892,12 +761,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @staticmethod
     def _set_expandable_segments(enable: bool) -> None:
-        """Toggle PyTorch's expandable_segments allocator setting at runtime.
-
-        ``expandable_segments`` is incompatible with vLLM's CuMemAllocator.
-        Following verl's pattern, we disable it for the *entire* duration
-        that the vLLM engine is awake, not just during engine creation.
-        """
+        """Toggle PyTorch expandable_segments (incompatible with vLLM CuMemAllocator)."""
         try:
             torch.cuda.memory._set_allocator_settings(
                 f"expandable_segments:{enable}"
@@ -906,7 +770,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             pass
 
     def _cleanup_vllm_engine(self) -> None:
-        """Destroy the persistent vLLM engine and free resources."""
+        """Sleep + destroy the persistent vLLM engine."""
         if self._vllm_engine is not None:
             # Try to sleep before destroying so CuMemAllocator releases
             # its memory-pool allocations (weights + KV cache).
@@ -920,28 +784,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self._vllm_engine_sleeping = False
             self._aggressive_empty_cache()
             logger.info("vLLM eval: persistent engine destroyed")
-        # NOTE: Do NOT delete /dev/shm/llamafactory_vllm_weights here.
-        # In multi-rank training, one rank may fail (e.g. OOM) and call
-        # this cleanup while other ranks still need the processor configs
-        # from the shared directory.  The config files are tiny (few KB)
-        # and harmless.  They will be overwritten on the next eval or
-        # cleaned up on process exit.
+        # Don't delete /dev/shm configs — other ranks may still need them.
 
     def _pre_init_vllm_parallel_state(self) -> None:
-        """Pre-initialise vLLM's distributed parallel state on ALL ranks.
-
-        vLLM's ``GroupCoordinator.__init__`` calls ``torch.distributed.new_group``
-        which is **collective** — every rank in the default process group must
-        participate.  Normally only rank 0 creates the vLLM engine, so the other
-        ranks never call ``new_group`` and the process dead-locks.
-
-        Fix: call ``init_distributed_environment`` and
-        ``ensure_model_parallel_initialized`` on **all ranks** *before* the
-        engine is created.  The ``new_group()`` calls are now properly
-        collective and complete without hanging.  When rank 0 subsequently
-        creates the engine, vLLM sees the state is already initialised and
-        skips all collective ops.
-        """
+        """Pre-init vLLM parallel state on ALL ranks (collective new_group requirement)."""
         from vllm.distributed.parallel_state import (
             _WORLD,
             ensure_model_parallel_initialized,
@@ -982,16 +828,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         eval_dataset: Optional["Dataset"],
         metric_key_prefix: str,
     ) -> dict[str, float]:
-        """vLLM evaluation with persistent engines using sleep/wake mode.
-
-        **Manual data parallelism**: every rank creates its own independent
-        TP=1 vLLM engine and generates on 1/N of the eval dataset.  Results
-        are gathered on rank 0 for metric computation.  This gives ~Nx
-        throughput compared to single-GPU eval.
-
-        First eval: save weights to /dev/shm → all ranks create engine → generate → sleep.
-        Subsequent evals: all ranks wake → reload weights → generate → sleep.
-        """
+        """vLLM eval with persistent sleep/wake engines (N-way data-parallel)."""
         import time
 
         import torch.distributed as dist
@@ -1003,29 +840,15 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         # --- Step 1 (all ranks): free GPU memory for vLLM ---
-        # HF Trainer stores the DeepSpeed engine as self.deepspeed (= self.model_wrapped),
-        # NOT as self.model.  self.model may be the bare module without the optimizer.
         _ds_engine = getattr(self, "deepspeed", None)
         has_ds = _ds_engine is not None and getattr(_ds_engine, "optimizer", None) is not None
 
-        # Zero out gradient buffers to free GPU memory.
         for param in unwrapped.parameters():
             param.grad = None
 
         if has_ds:
-            # DeepSpeed ZeRO-2: keep training state on GPU.
-            #
-            # DeepSpeed's internal reference chain (parallel_partitioned_bit16_groups
-            # → narrow() views of flat buffer, optimizer.state keys → FP32 master
-            # weights, param._hp_mapping.optim_fragment → optimizer state views)
-            # makes it impossible to fully offload GPU memory via .data replacement.
-            # Attempting to offload leaves ~30 GiB of "zombie" GPU memory that
-            # cannot be freed until the references are cleared.
-            #
-            # Instead, we keep everything on GPU and let vLLM's dynamic
-            # gpu_memory_utilization cap (in _create_vllm_engine) use whatever
-            # free memory remains.  After vLLM sleep, training resumes
-            # immediately without any restore step.
+            # DeepSpeed ZeRO-2: keep state on GPU (internal refs prevent full
+            # offload).  vLLM uses whatever free memory remains.
             self._aggressive_empty_cache()
         else:
             # Non-DeepSpeed: simply move model to CPU.
@@ -1043,9 +866,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._pre_init_vllm_parallel_state()
 
         # --- Step 3 (all ranks): disable expandable_segments, create or wake engine ---
-        # Following verl's pattern: expandable_segments stays disabled for
-        # the entire duration that the vLLM engine is awake, because it
-        # conflicts with vLLM's CuMemAllocator virtual-memory allocations.
         self._set_expandable_segments(False)
 
         metrics: dict[str, float] = {}
@@ -1089,10 +909,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     logger.info("vLLM eval [sleep/wake]: rank %d — engine created from %s (%.1fs)", rank, model_path, time.time() - t0)
                 self._vllm_engine_sleeping = False
             else:
-                # --- Subsequent eval: wake up and reload weights ---
-                # Following verl's pattern: wake weights first, sync, then
-                # clean up before allocating KV cache so it has maximum
-                # free memory available.
+                # --- Subsequent eval: wake + reload weights ---
                 t0 = time.time()
                 self._vllm_engine.wake_up(tags=["weights"])
                 self._sync_weights_to_vllm(unwrapped)
@@ -1124,34 +941,24 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             t0 = time.time()
             local_done = 0
 
-            # Chat template kwargs (e.g. enable_thinking for Qwen3).
-            # Explicitly pass the flag so vLLM doesn't fall back to the
-            # model's default (which may differ from the training config).
+            # Chat template kwargs (match training config, not model default).
             chat_kwargs: dict[str, Any] = {}
             if self.data_args and hasattr(self.data_args, "enable_thinking"):
                 chat_kwargs["enable_thinking"] = bool(self.data_args.enable_thinking)
 
-            # Pass video/image processing parameters so vLLM matches
-            # the training-time preprocessing (resolution, fps, max frames).
-            # NOTE: do_sample_frames must be False.  vLLM's VideoMediaIO
-            # already samples frames using the num_frames configured in
-            # media_io_kwargs (see _create_vllm_engine).  Setting
-            # do_sample_frames=True causes the HF processor to resample
-            # from the already-sampled array using the *original* video
-            # frame count, producing out-of-bounds indices.
+            # Video/image processing params (match training-time preprocessing).
             mm_kwargs: dict[str, Any] = {}
             if self.model_args:
                 mm_kwargs["max_pixels"] = getattr(self.model_args, "video_max_pixels", 921600)
                 mm_kwargs["min_pixels"] = getattr(self.model_args, "video_min_pixels", 1)
 
-            # Suppress vLLM's verbose logging during generation so the
-            # progress bar is not drowned out.
+            # Suppress vLLM verbose logging during generation.
             import logging as _logging
             _vllm_logger = _logging.getLogger("vllm")
             _vllm_prev_level = _vllm_logger.level
             _vllm_logger.setLevel(_logging.WARNING)
 
-            # Rank 0 shows a single tqdm progress bar for all GPUs.
+            # Progress bar on rank 0 only.
             import sys
             pbar = None
             if rank == 0:
@@ -1207,26 +1014,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 rank, len(local_preds), time.time() - t0,
             )
 
-            # --- Step 5 (all ranks): sleep engine ---
-            # vLLM's CuMemAllocator (enabled by sleep mode) uses cuMemCreate
-            # virtual memory, which IS released back to the system on sleep.
-            # This allows training to reclaim the GPU memory.
+            # --- Step 5 (all ranks): sleep engine (releases GPU memory) ---
             if is_training:
-                # Clear multimodal encoder cache + prefix cache BEFORE sleep.
-                # These caches hold processed video/image features on GPU and
-                # are NOT released by sleep(level=2).
                 self._vllm_engine.reset_prefix_cache()
                 self._vllm_engine.sleep(level=2)
                 self._vllm_engine_sleeping = True
                 self._aggressive_empty_cache()
 
-                free_mem, total_mem = torch.cuda.mem_get_info()
-                logger.info(
-                    "vLLM eval [sleep/wake]: rank %d — after sleep: free=%.1f / %.1f GiB",
-                    rank, free_mem / 2**30, total_mem / 2**30,
-                )
-
-            # --- Step 6: gather predictions on rank 0 ---
+            # --- Step 6: gather predictions → compute metrics on rank 0 ---
             if world_size > 1:
                 gathered_preds: list[list[str]] | None = [None] * world_size if rank == 0 else None  # type: ignore[assignment]
                 gathered_labels: list[list[str]] | None = [None] * world_size if rank == 0 else None  # type: ignore[assignment]
@@ -1234,7 +1029,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 dist.gather_object(local_labels, gathered_labels, dst=0)
 
                 if rank == 0:
-                    # Reconstruct original order: interleave shards.
+                    # Reconstruct original order from interleaved shards.
                     all_preds = [""] * total_len
                     all_labels = [""] * total_len
                     for src_rank in range(world_size):
@@ -1288,11 +1083,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         eval_dataset: Optional["Dataset"],
         metric_key_prefix: str,
     ) -> dict[str, float]:
-        """Legacy vLLM evaluation: create engine → generate → destroy each eval step.
-
-        Flow: save weights → offload training model → create vLLM engine → generate → destroy engine → restore.
-        In-process (no subprocess), avoids NCCL/env conflicts.
-        """
+        """Legacy vLLM eval: create → generate → destroy per eval step (rank 0 only)."""
         import gc
         import shutil
         import time
@@ -1359,15 +1150,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     skip_special_tokens=True,
                 )
 
-                # Chat template kwargs (e.g. enable_thinking for Qwen3).
-                # Explicitly pass the flag so vLLM doesn't fall back to the
-                # model's default (which may differ from the training config).
                 chat_kwargs: dict[str, Any] = {}
                 if self.data_args and hasattr(self.data_args, "enable_thinking"):
                     chat_kwargs["enable_thinking"] = bool(self.data_args.enable_thinking)
 
-                # Pass video/image processing parameters so vLLM matches
-                # the training-time preprocessing (resolution, fps, max frames).
                 mm_kwargs: dict[str, Any] = {}
                 if self.model_args:
                     mm_kwargs["max_pixels"] = getattr(self.model_args, "video_max_pixels", 921600)
@@ -1434,7 +1220,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return metrics
 
     # ------------------------------------------------------------------
-    #  vLLM eval metric helpers (reuse logic from ComputeVideoRewardAccuracy)
+    #  vLLM eval metric helpers
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1647,13 +1433,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             logger.info_rank0("[ERROR] Logits dim: {}, labels: {}".format(logits.dim(), labels is not None))
             return
 
-        # Check if STP modified the labels (token removal mode)
-        # In this case, use the modified labels that match logits length
+        # Use STP-modified labels if they match logits length
         if hasattr(self.model, "_stp_modified_labels") and self.model._stp_modified_labels is not None:
             modified_labels = self.model._stp_modified_labels
             if modified_labels.shape[1] == logits.shape[1]:
                 labels = modified_labels
-            # Clear the stored labels to avoid using stale data
             self.model._stp_modified_labels = None
 
         tokenizer = None
@@ -1692,24 +1476,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self._train_video_reward_correct_count += matched
             self._train_video_reward_total_count += 1
 
-            # if (
-            #     self._enable_prediction_logging
-            #     and len(self._train_prediction_samples) < self._max_prediction_samples
-            # ):
-            #     prompt = ""
-            #     if isinstance(input_ids, torch.Tensor) and input_texts is not None and idx < len(input_texts):
-            #         prompt = input_texts[idx]
-            #     logger.info_rank0("Prediction: {}\nLabel: {}\nMatch: {}".format(pred, label, matched))
-            #     self._train_prediction_samples.append(
-            #         {
-            #             "id": uuid.uuid4().hex,
-            #             "prompt": prompt,
-            #             "prediction": pred,
-            #             "target": label,
-            #             "match": matched,
-            #         }
-            #     )
-
     @override
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         if (
@@ -1718,20 +1484,15 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             and "loss" in logs
             and not any(key.startswith("eval_") or key.startswith("predict_") for key in logs)
         ):
-            # Compute cumulative accuracy (do not clear counters to track cumulative accuracy).
             logs["video_reward_cumulative_accuracy"] = float(
                 self._train_video_reward_correct_count / self._train_video_reward_total_count
             )
-            # self._log_predictions_to_wandb_table(stage="train")
         super().log(logs, start_time=start_time)
 
     def save_predictions(
         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True
     ) -> None:
-        r"""Save model predictions to `output_dir`.
-
-        A custom behavior that not contained in Seq2SeqTrainer.
-        """
+        r"""Save decoded predictions to ``generated_predictions.jsonl``."""
         if not self.is_world_process_zero():
             return
 
