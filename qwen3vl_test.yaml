@@ -1,9 +1,7 @@
 ### model
-# model_name_or_path: lime-nlp/VERM-8B
-model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
-# model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct
-# model_name_or_path: ShijianW01/Video-Thinker-7B
-# model_name_or_path: Video-R1/Video-R1-7B
+model_name_or_path: lime-nlp/VERM-8B
+# model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
+# model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct  # use qwen2_vl template
 
 video_fps: 1.0
 video_maxlen: 100
@@ -18,17 +16,14 @@ stage: sft
 
 ### dataset
 do_eval: true
-use_vllm_eval: true
+# use_vllm_eval: true
 predict_with_generate: true
-eval_dataset: osworld_agentnet_testset_720p,scalecua_testset
+eval_dataset: osworld_agentnet_testset,scalecua_testset
 cutoff_len: 128000
 overwrite_cache: true
 preprocessing_num_workers: 16
 preprocessing_batch_size: 200
-vllm_eval_max_model_len: 32800
-vllm_eval_gpu_util: 0.6
-vllm_eval_tp_size: 1
-vllm_eval_batch_size: 1
+max_new_tokens: 256
 
 ### output
 eval_save_predictions: true

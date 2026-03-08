@@ -361,7 +361,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # Forward _gen_kwargs to prevent Seq2SeqTrainer from overwriting
         # max_new_tokens with max_length (128000).
         _orig_gen_kwargs = self._gen_kwargs.copy() if hasattr(self, "_gen_kwargs") else {}
-        return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **_orig_gen_kwargs, **kwargs)
+        _orig_gen_kwargs.update(kwargs)  # caller-provided kwargs take precedence
+        return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **_orig_gen_kwargs)
 
     def _vllm_evaluate(
         self,

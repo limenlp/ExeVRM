@@ -186,3 +186,4 @@ generated_predictions.jsonl
 predictions_score.json
 benchmark_results/
 data/*/original_thinking*/
+trainer_output/
