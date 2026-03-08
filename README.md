@@ -1,5 +1,7 @@
 # VERM: Video Execution Reward Modeling
 
+Official implementation for the paper `Reward Modeling for Computer-Using Agent from Video Execution`
+
 VERM is a training framework for video-based execution reward models, built on top of [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory). It fine-tunes vision-language models (e.g., Qwen3-VL) to judge whether a computer-use agent's video trajectory successfully completes a given task.
 
 VERM introduces two key token reduction techniques — **STP (Spatial Token Pruning)** and **TTP (Temporal Token Pruning)** — that dramatically reduce the number of visual tokens in long video inputs, enabling efficient training and inference on execution videos with up to 50+ frames at 720p resolution.
