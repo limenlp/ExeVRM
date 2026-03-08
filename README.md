@@ -1,4 +1,6 @@
-# VERM: Video Execution Reward Modeling
+# VERM: Video Execution Reward Modeling for Computer-using Agent
+
+Official implementation for the paper `Reward Modeling for Computer-Using Agent from Video Execution`
 
 VERM is a training framework for video-based execution reward models, built on top of [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory). It fine-tunes vision-language models (e.g., Qwen3-VL) to judge whether a computer-use agent's video trajectory successfully completes a given task.
 
