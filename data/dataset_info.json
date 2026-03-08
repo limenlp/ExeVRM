@@ -30,8 +30,8 @@
   "scalecua_testset": {
     "file_name": "scalecua_testset.jsonl",
     "formatting": "sharegpt",
-    "use_stp": false,
-    "use_ttp": false,
+    "use_stp": null,
+    "use_ttp": null,
     "columns": {
       "messages": "conversations",
       "videos": "videos"
@@ -40,8 +40,8 @@
   "osworld_agentnet_testset": {
     "file_name": "osworld_agentnet_testset_720p.jsonl",
     "formatting": "sharegpt",
-    "use_stp": false,
-    "use_ttp": false,
+    "use_stp": null,
+    "use_ttp": null,
     "columns": {
       "messages": "conversations",
       "videos": "videos"
