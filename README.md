@@ -1,4 +1,4 @@
-# VERM: Video Execution Reward Modeling for Computer-using Agent
+# VERM: Video Execution Reward Modeling
 
 Official implementation for the paper `Reward Modeling for Computer-Using Agent from Video Execution`
 
