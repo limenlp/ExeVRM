@@ -34,7 +34,7 @@ deepspeed: deepspeed/z2.json
 ### evaluation
 do_eval: true
 predict_with_generate: true
-eval_dataset: osworld_agentnet_testset,scalecua_testset
+eval_dataset: verbench
 eval_strategy: steps
 eval_steps: 200
 per_device_eval_batch_size: 1

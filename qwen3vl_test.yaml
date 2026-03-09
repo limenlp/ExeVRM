@@ -16,9 +16,8 @@ stage: sft
 
 ### dataset
 do_eval: true
-# use_vllm_eval: true
 predict_with_generate: true
-eval_dataset: osworld_agentnet_testset,scalecua_testset
+eval_dataset: verbench
 cutoff_len: 128000
 overwrite_cache: true
 preprocessing_num_workers: 16

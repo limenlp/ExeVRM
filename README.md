@@ -16,6 +16,19 @@ cd VERM
 pip install -e ".[torch,metrics,deepspeed,liger-kernel,vllm]"
 ```
 
+### Dataset prepration
+
+- Download dataset from `lime-nlp/VER-53K` and follow the instruction to reassembling the training set videos.
+- Use `replace_video_prefix.py` to update all video paths in the annotation files (`ver53k.jsonl` and `verbench.jsonl`):
+
+```bash
+# Replace the default prefix (/export/home/VER_53k) with a new one
+python replace_video_prefix.py /new/path/to/VER_53k
+
+# Or specify a custom old prefix
+python replace_video_prefix.py --old_prefix /old/path/to/VER_53k /new/path/to/VER_53k
+```
+
 ### Training
 
 ```bash

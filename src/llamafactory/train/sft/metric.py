@@ -149,9 +149,8 @@ class ComputeVideoRewardAccuracy:
             return "ubuntu"
         elif basename.startswith("winmac_"):
             return "winmac"
-        # ScaleCUA videos have UUID filenames but the path contains "scalecua"
-        elif "scalecua" in video_path_lower:
-            return "scalecua"
+        elif basename.startswith("android_"):
+            return "android"
         return "unknown"
 
     @staticmethod
@@ -192,7 +191,7 @@ class ComputeVideoRewardAccuracy:
     def _compute_range_metrics(predictions: list) -> dict:
         """Compute temporal range metrics for predictions that have time ranges.
 
-        Only considers samples where label has a time range (i.e., scalecua incorrect samples).
+        Only considers samples where label has a time range (i.e., android incorrect samples).
         Uses temporal IoU (tIoU) as the primary metric.
 
         Returns dict with:

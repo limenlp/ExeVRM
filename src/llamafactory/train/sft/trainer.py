@@ -1247,7 +1247,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @staticmethod
     def _detect_split(video_path: str) -> str:
-        """Detect split from video path (osworld, ubuntu, winmac, scalecua)."""
+        """Detect split from video path (osworld, ubuntu, winmac, android)."""
         lp = video_path.lower()
         basename = lp.rsplit("/", 1)[-1] if "/" in lp else lp
         if basename.startswith("osworld_"):
@@ -1256,8 +1256,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return "ubuntu"
         elif basename.startswith("winmac_"):
             return "winmac"
-        elif "scalecua" in lp:
-            return "scalecua"
+        elif basename.startswith("android_"):
+            return "android"
         return "unknown"
 
     @staticmethod

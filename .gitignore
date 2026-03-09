@@ -187,3 +187,5 @@ predictions_score.json
 benchmark_results/
 data/*/original_thinking*/
 trainer_output/
+data/scalecua_training/
+data/osworld_agentnet_training/

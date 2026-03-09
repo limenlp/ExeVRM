@@ -7,8 +7,8 @@
       "videos": "videos"
     }
   },
-  "osworld_agentnet_reward": {
-    "file_name": "osworld_agentnet_training/original/shards",
+  "ver53k": {
+    "file_name": "ver53k/shards",
     "formatting": "sharegpt",
     "use_stp": null,
     "use_ttp": null,
@@ -17,28 +17,8 @@
       "videos": "videos"
     }
   },
-  "scalecua_reward": {
-    "file_name": "scalecua_training/original/shards",
-    "formatting": "sharegpt",
-    "use_stp": null,
-    "use_ttp": null,
-    "columns": {
-      "messages": "conversations",
-      "videos": "videos"
-    }
-  },
-  "scalecua_testset": {
-    "file_name": "scalecua_testset.jsonl",
-    "formatting": "sharegpt",
-    "use_stp": null,
-    "use_ttp": null,
-    "columns": {
-      "messages": "conversations",
-      "videos": "videos"
-    }
-  },
-  "osworld_agentnet_testset": {
-    "file_name": "osworld_agentnet_testset_720p.jsonl",
+  "verbench": {
+    "file_name": "verbench.jsonl",
     "formatting": "sharegpt",
     "use_stp": null,
     "use_ttp": null,
