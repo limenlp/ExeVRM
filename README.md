@@ -1,18 +1,18 @@
-# VERM: Video Execution Reward Modeling
+# ExeVRM: Execution Video Reward Modeling
 
-Official implementation for the paper `Reward Modeling for Computer-Using Agent from Video Execution`
+Official implementation for the paper `Execution Video Reward Modeling for Computer-Using Agents`
 
-VERM is a training framework for video-based execution reward models, built on top of [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory). It fine-tunes vision-language models (e.g., Qwen3-VL) to judge whether a computer-use agent's video trajectory successfully completes a given task.
+ExeVRM is a training framework for execution video reward models, built on top of [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory). It fine-tunes vision-language models (e.g., Qwen3-VL) to judge whether a computer-use agent's video trajectory successfully completes a given task.
 
-VERM introduces two key token reduction techniques — **STP (Spatial Token Pruning)** and **TTP (Temporal Token Pruning)** — that dramatically reduce the number of visual tokens in long video inputs, enabling efficient training and inference on execution videos with up to 50+ frames at 720p resolution.
+ExeVRM introduces two key token reduction techniques — **STP (Spatial Token Pruning)** and **TTP (Temporal Token Pruning)** — that dramatically reduce the number of visual tokens in long video inputs, enabling efficient training and inference on execution videos with up to 50+ frames at 720p resolution.
 
 ## Quick Start
 
 ### Installation
 
 ```bash
-git clone https://github.com/lime-nlp/VERM.git
-cd VERM
+git clone https://github.com/lime-nlp/ExeVRM.git
+cd ExeVRM
 pip install -e ".[torch,metrics,deepspeed,liger-kernel,vllm]"
 ```
 
@@ -43,7 +43,7 @@ llamafactory-cli train qwen3vl_test.yaml
 
 ## Core Concepts: STP & TTP
 
-Computer-use execution videos are highly redundant — most screen regions remain static across frames, and consecutive frames are nearly identical during periods of inactivity. VERM exploits these two types of redundancy through spatial and temporal token pruning.
+Computer-use execution videos are highly redundant — most screen regions remain static across frames, and consecutive frames are nearly identical during periods of inactivity. ExeVRM exploits these two types of redundancy through spatial and temporal token pruning.
 
 ### STP (Spatial Token Pruning)
 
@@ -214,7 +214,7 @@ Datasets are registered in `data/dataset_info.json`. Per-dataset STP/TTP overrid
 ## Project Structure
 
 ```
-VERM/
+ExeVRM/
 ├── qwen3vl.yaml                  # Training config (STP + TTP enabled)
 ├── qwen3vl_test.yaml             # Evaluation config
 ├── src/llamafactory/
@@ -245,10 +245,10 @@ Per-GPU logs are written to `/tmp/ttp_forward_debug_rank{rank}.log`.
 
 ## Acknowledgements
 
-VERM is built on [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) by hiyouga et al.
+ExeVRM is built on [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) by hiyouga et al.
 
 ## Citation
-If you use VERM/VER-53k in your research, please cite our work:
+If you use ExeVRM/ExeVR-53k in your research, please cite our work:
 ```
 TBD
 ```
