@@ -247,6 +247,12 @@ Per-GPU logs are written to `/tmp/ttp_forward_debug_rank{rank}.log`.
 
 VERM is built on [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) by hiyouga et al.
 
+## Citation
+If you use VERM/VER-53k in your research, please cite our work:
+```
+TBD
+```
+
 ## License
 
 This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
