@@ -51,7 +51,7 @@ preprocessing_batch_size: 2
 dataloader_num_workers: 16
 
 ### output
-output_dir: save_models/qwen3vl-8b/full/qwen3-vl-8B--720p-stp-ttp-hybrid-scalecua-50frames--5
+output_dir: save_models/qwen3vl-8b/full/qwen3-vl-8B--720p-stp-ttp-hybrid-scalecua-50frames
 
 logging_steps: 1
 save_steps: 200

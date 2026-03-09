@@ -14,8 +14,8 @@ import json
 import os
 
 JSONL_FILES = [
-    os.path.join(os.path.dirname(__file__), "data/ver53k/ver53k.jsonl"),
-    os.path.join(os.path.dirname(__file__), "data/verbench.jsonl"),
+    os.path.join(os.path.dirname(__file__), "data/exevr53k/exevr53k.jsonl"),
+    os.path.join(os.path.dirname(__file__), "data/exevrbench.jsonl"),
 ]
 
 
@@ -41,7 +41,7 @@ def replace_prefix(file_path, old_prefix, new_prefix):
 
 def main():
     parser = argparse.ArgumentParser(description="Replace video path prefix in dataset files.")
-    parser.add_argument("--old_prefix", default="/export/home/VER_53k", help="Old path prefix to replace (default: /export/home/VER_53k)")
+    parser.add_argument("--old_prefix", default="/export/home/ExeVR_53k", help="Old path prefix to replace (default: /export/home/ExeVR_53k)")
     parser.add_argument("new_prefix", help="New path prefix")
     args = parser.parse_args()
 

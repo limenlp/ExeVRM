@@ -1,5 +1,5 @@
 ### model
-model_name_or_path: lime-nlp/VERM-8B
+model_name_or_path: lime-nlp/ExeVRM-8B
 # model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
 # model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct  # use qwen2_vl template
 

@@ -7,8 +7,8 @@
       "videos": "videos"
     }
   },
-  "ver53k": {
-    "file_name": "ver53k/shards",
+  "exevr53k": {
+    "file_name": "exevr53k/shards",
     "formatting": "sharegpt",
     "use_stp": null,
     "use_ttp": null,
@@ -17,8 +17,8 @@
       "videos": "videos"
     }
   },
-  "verbench": {
-    "file_name": "verbench.jsonl",
+  "exevrbench": {
+    "file_name": "exevrbench.jsonl",
     "formatting": "sharegpt",
     "use_stp": null,
     "use_ttp": null,
