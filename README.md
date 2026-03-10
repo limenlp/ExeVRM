@@ -1,6 +1,6 @@
 # ExeVRM: Execution Video Reward Modeling
 
-Official implementation for the paper `Video-Based Reward Modeling for Computer-Using Agents`
+Official implementation for the paper `Video-Based Reward Modeling for Computer-Use Agents`
 
 ExeVRM is a training framework for execution video reward models, built on top of [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory). It fine-tunes vision-language models (e.g., Qwen3-VL) to judge whether a computer-use agent's video trajectory successfully completes a given task.
 
