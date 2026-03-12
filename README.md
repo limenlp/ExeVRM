@@ -250,7 +250,15 @@ ExeVRM is built on [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) by 
 ## Citation
 If you use ExeVRM/ExeVR-53k in your research, please cite our work:
 ```
-TBD
+@misc{song2026videobasedrewardmodelingcomputeruse,
+      title={Video-Based Reward Modeling for Computer-Use Agents}, 
+      author={Linxin Song and Jieyu Zhang and Huanxin Sheng and Taiwei Shi and Gupta Rahul and Yang Liu and Ranjay Krishna and Jian Kang and Jieyu Zhao},
+      year={2026},
+      eprint={2603.10178},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2603.10178}, 
+}
 ```
 
 ## License
