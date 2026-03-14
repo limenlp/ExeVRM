@@ -4,7 +4,7 @@ Official implementation for the paper `Video-Based Reward Modeling for Computer-
 
 ExeVRM is a training framework for execution video reward models, built on top of [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory). It fine-tunes vision-language models (e.g., Qwen3-VL) to judge whether a computer-use agent's video trajectory successfully completes a given task.
 
-ExeVRM introduces two key token reduction techniques — **STP (Spatial Token Pruning)** and **TTP (Temporal Token Pruning)** — that dramatically reduce the number of visual tokens in long video inputs, enabling efficient training and inference on execution videos with up to 50+ frames at 720p resolution.
+ExeVRM introduces two key token pruning techniques — **STP (Spatial Token Pruning)** and **TTP (Temporal Token Pruning)** — that dramatically reduce the number of visual tokens in long video inputs, enabling efficient training and inference on execution videos with up to 50+ frames at 720p resolution.
 
 ## Quick Start
 
@@ -16,9 +16,9 @@ cd ExeVRM
 pip install -e ".[torch,metrics,deepspeed,liger-kernel,vllm]"
 ```
 
-### Dataset prepration
+### Dataset preparation
 
-- Download dataset from `lime-nlp/ExeVR-53K` and follow the instruction to reassembling the training set videos.
+- Download dataset from [`lime-nlp/ExeVR-53K`](https://huggingface.co/datasets/lime-nlp/ExeVR-53k) and follow the instructions to reassemble the training set videos.
 - Use `replace_video_prefix.py` to update all video paths in the annotation files (`exevr53k.jsonl` and `exevrbench.jsonl`):
 
 ```bash
